@@ -7,7 +7,7 @@
 
 用法：
     python index_weight_to_instruments.py
-    python index_weight_to_instruments.py --start_date 202600301 --end_date 20260331
+    python index_weight_to_instruments.py --start_date 20260301 --end_date 20260331
     python index_weight_to_instruments.py --output_dir D:/qlib_data/qlib_data/instruments
 """
 

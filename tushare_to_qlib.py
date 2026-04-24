@@ -9,7 +9,7 @@ Tushare数据获取并转换为Qlib格式的脚本
 3. 保存到指定目录：D:/qlib_data/qlib_data
 
 使用方法：
-    python tushare_to_qlib.py --start_date 20200101 --end_date 20231231
+    python tushare_to_qlib.py --start_date 20200101 --end_date 20260424
     或设置环境变量 TUSHARE_API_KEY 后直接运行
 """
 
