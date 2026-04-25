@@ -37,6 +37,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Qlib 常用特征名 ← 数据源列（前复权 OHLC；volume 使用量比，与 vol 手数无关）
+QLIB_STD_OHLCV_FROM: Dict[str, str] = {
+    "open": "open_qfq",
+    "high": "high_qfq",
+    "low": "low_qfq",
+    "close": "close_qfq",
+    "volume": "volume_ratio",
+}
+
+
+def add_qlib_standard_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    为 DataFrame 增加 open、high、low、close、volume 列，内容分别来自
+    open_qfq、high_qfq、low_qfq、close_qfq、volume_ratio。
+    不删除或重命名原有列；源列不存在时跳过对应目标列。
+    """
+    if df is None or len(df) == 0:
+        return df
+    for target, source in QLIB_STD_OHLCV_FROM.items():
+        if source in df.columns:
+            df[target] = df[source]
+    return df
+
 
 class APIRateLimiter:
     """
@@ -645,7 +668,13 @@ class QlibDataConverter:
 
         logger.info(f"股票池信息已保存: {instruments_path}, 共 {len(stock_list)} 只股票")
 
-    def dataframe_to_bin(self, df: pd.DataFrame, field: str, freq: str = 'day'):
+    def dataframe_to_bin(
+        self,
+        df: pd.DataFrame,
+        field: str,
+        freq: str = 'day',
+        source_field: Optional[str] = None,
+    ):
         """
         将单个字段的数据转换为bin格式
 
@@ -656,17 +685,19 @@ class QlibDataConverter:
 
         参数：
             df: DataFrame，包含datetime索引和目标字段
-            field: 字段名
+            field: 输出 bin 文件名所用字段名（如 open）
             freq: 频率
+            source_field: 若指定，从该列读取数值，仍写入 field 对应的 .bin 文件
         """
-        if field not in df.columns:
-            logger.warning(f"字段 {field} 不存在")
+        col = source_field if source_field is not None else field
+        if col not in df.columns:
+            logger.warning(f"字段 {col} 不存在")
             return
 
         bin_path = self.features_dir / f"{field.lower()}.{freq}.bin"
 
         # 准备数据：确保有datetime索引
-        data = df[field].dropna()
+        data = df[col].dropna()
 
         if len(data) == 0:
             logger.warning(f"字段 {field} 没有有效数据")
@@ -766,6 +797,14 @@ class QlibDataConverter:
                 self.dataframe_to_bin(merged_df, field)
             except Exception as e:
                 logger.error(f"转换字段 {field} 失败: {e}")
+
+        for target, source in QLIB_STD_OHLCV_FROM.items():
+            if source not in merged_df.columns:
+                continue
+            try:
+                self.dataframe_to_bin(merged_df, target, freq='day', source_field=source)
+            except Exception as e:
+                logger.error(f"转换标准字段 {target}（来自 {source}）失败: {e}")
 
         logger.info(f"Qlib格式转换完成！数据保存在: {self.output_dir}")
 
@@ -1038,6 +1077,7 @@ class DataPipeline:
 
             # 重置索引，将instrument和 datetime变为普通列
             df_to_save = df.reset_index()
+            add_qlib_standard_ohlcv_columns(df_to_save)
 
             # 保存为CSV
             df_to_save.to_csv(csv_path, index=False, encoding='utf-8-sig')
@@ -1166,6 +1206,14 @@ class DataPipeline:
             return False
 
         logger.info(f"找到 {len(csv_files)} 个CSV文件")
+
+        for csv_path in csv_files:
+            try:
+                df_patch = pd.read_csv(csv_path, encoding="utf-8-sig")
+                add_qlib_standard_ohlcv_columns(df_patch)
+                df_patch.to_csv(csv_path, index=False, encoding="utf-8-sig")
+            except Exception as e:
+                logger.warning("为 %s 写入标准 OHLCV 列失败: %s", csv_path.name, e)
 
         sample = pd.read_csv(csv_files[0], nrows=512, encoding="utf-8-sig")
         skip_cols = {"datetime", "instrument", "trade_date", "ts_code"}
