@@ -1,17 +1,12 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Tushare数据获取并转换为Qlib格式的脚本
+Tushare鏁版嵁鑾峰彇骞惰浆鎹负Qlib鏍煎紡鐨勮剼鏈?
+鍔熻兘锛?1. 浠嶵ushare鑾峰彇澶氫釜鎺ュ彛鐨勬暟鎹紙鎶€鏈洜瀛愩€佽祫閲戞祦鍚戙€佽瀺璧勮瀺鍒搞€佽储鍔℃寚鏍囷級
+2. 灏嗘暟鎹悎骞跺苟杞崲涓篞lib鏍囧噯鏍煎紡锛?bin鏂囦欢锛?3. 淇濆瓨鍒版寚瀹氱洰褰曪細D:/qlib_data/qlib_data
 
-功能：
-1. 从Tushare获取多个接口的数据（技术因子、资金流向、融资融券、财务指标）
-2. 将数据合并并转换为Qlib标准格式（.bin文件）
-3. 保存到指定目录：D:/qlib_data/qlib_data
-
-使用方法：
-    python tushare_to_qlib.py --start_date 20200101 --end_date 20260424
-    或设置环境变量 TUSHARE_API_KEY 后直接运行
-"""
+浣跨敤鏂规硶锛?    python tushare_to_qlib.py --start_date 20200101 --end_date 20260424
+    鎴栬缃幆澧冨彉閲?TUSHARE_API_KEY 鍚庣洿鎺ヨ繍琛?"""
 
 from __future__ import annotations
 
@@ -21,6 +16,10 @@ import os
 import sys
 import time
 import threading
+
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from collections import deque
@@ -37,8 +36,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Qlib 常用特征名 ← 数据源列（前复权 OHLC；volume 使用量比，与 vol 手数无关）
-QLIB_STD_OHLCV_FROM: Dict[str, str] = {
+# Qlib 甯哥敤鐗瑰緛鍚?鈫?鏁版嵁婧愬垪锛堝墠澶嶆潈 OHLC锛泇olume 浣跨敤閲忔瘮锛屼笌 vol 鎵嬫暟鏃犲叧锛?QLIB_STD_OHLCV_FROM: Dict[str, str] = {
     "open": "open_qfq",
     "high": "high_qfq",
     "low": "low_qfq",
@@ -49,10 +47,8 @@ QLIB_STD_OHLCV_FROM: Dict[str, str] = {
 
 def add_qlib_standard_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    为 DataFrame 增加 open、high、low、close、volume 列，内容分别来自
-    open_qfq、high_qfq、low_qfq、close_qfq、volume_ratio。
-    不删除或重命名原有列；源列不存在时跳过对应目标列。
-    """
+    涓?DataFrame 澧炲姞 open銆乭igh銆乴ow銆乧lose銆乿olume 鍒楋紝鍐呭鍒嗗埆鏉ヨ嚜
+    open_qfq銆乭igh_qfq銆乴ow_qfq銆乧lose_qfq銆乿olume_ratio銆?    涓嶅垹闄ゆ垨閲嶅懡鍚嶅師鏈夊垪锛涙簮鍒椾笉瀛樺湪鏃惰烦杩囧搴旂洰鏍囧垪銆?    """
     if df is None or len(df) == 0:
         return df
     for target, source in QLIB_STD_OHLCV_FROM.items():
@@ -63,25 +59,18 @@ def add_qlib_standard_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 class APIRateLimiter:
     """
-    Tushare API 频率限制器
+    Tushare API 棰戠巼闄愬埗鍣?
+    鏍规嵁鍚勬帴鍙ｇ殑瀹樻柟棰戠巼闄愬埗鑷姩鎺у埗璇锋眰閫熺巼锛?    鏀寔鍔ㄦ€佽皟鏁村拰閿欒閲嶈瘯鏈哄埗銆?
+    瀹樻柟棰戠巼闄愬埗锛堟潵鑷猅ushare鏂囨。锛夛細
+    - stk_factor_pro: 5000绉垎=30娆?鍒嗛挓, 8000+绉垎=500娆?鍒嗛挓
+    - moneyflow_dc: 5000绉垎锛堜繚瀹堜及璁?0娆?鍒嗛挓锛?    - margin_detail: 2000绉垎锛堜繚瀹堜及璁?0娆?鍒嗛挓锛?    - fina_indicator: 2000绉垎锛堜繚瀹堜及璁?0娆?鍒嗛挓锛?    - stock_basic: 鍩虹鎺ュ彛锛堣緝瀹芥澗锛?    """
 
-    根据各接口的官方频率限制自动控制请求速率，
-    支持动态调整和错误重试机制。
-
-    官方频率限制（来自Tushare文档）：
-    - stk_factor_pro: 5000积分=30次/分钟, 8000+积分=500次/分钟
-    - moneyflow_dc: 5000积分（保守估计30次/分钟）
-    - margin_detail: 2000积分（保守估计30次/分钟）
-    - fina_indicator: 2000积分（保守估计30次/分钟）
-    - stock_basic: 基础接口（较宽松）
-    """
-
-    # 各接口的频率配置 (请求次数/分钟)
+    # 鍚勬帴鍙ｇ殑棰戠巼閰嶇疆 (璇锋眰娆℃暟/鍒嗛挓)
     RATE_LIMITS = {
         'stk_factor_pro': {
-            'normal': 30,      # 5000积分用户
-            'high': 500,       # 8000+积分用户
-            'current': 30      # 当前使用的速率
+            'normal': 30,      # 5000绉垎鐢ㄦ埛
+            'high': 500,       # 8000+绉垎鐢ㄦ埛
+            'current': 30      # 褰撳墠浣跨敤鐨勯€熺巼
         },
         'moneyflow_dc': {
             'normal': 30,
@@ -94,8 +83,7 @@ class APIRateLimiter:
             'current': 30
         },
         'fina_indicator': {
-            'normal': 20,      # 财务指标接口更严格
-            'high': 40,
+            'normal': 20,      # 璐㈠姟鎸囨爣鎺ュ彛鏇翠弗鏍?            'high': 40,
             'current': 20
         },
         'stock_basic': {
@@ -105,60 +93,51 @@ class APIRateLimiter:
         }
     }
 
-    # 错误重试配置
+    # 閿欒閲嶈瘯閰嶇疆
     MAX_RETRIES = 3
-    RETRY_DELAYS = [1, 2, 4]  # 重试延迟（秒），指数退避
-
+    RETRY_DELAYS = [1, 2, 4]  # 閲嶈瘯寤惰繜锛堢锛夛紝鎸囨暟閫€閬?
     def __init__(self, high_speed: bool = False):
         """
-        初始化频率限制器
+        鍒濆鍖栭鐜囬檺鍒跺櫒
 
-        参数：
-            high_speed: 是否使用高速模式（需要8000+积分）
-        """
+        鍙傛暟锛?            high_speed: 鏄惁浣跨敤楂橀€熸ā寮忥紙闇€瑕?000+绉垎锛?        """
         self.high_speed = high_speed
         self.request_history: Dict[str, deque] = {}
         self.mode = 'high' if high_speed else 'normal'
-        # 并发场景下按接口加锁，确保同一接口的限频逻辑线程安全
+        # 骞跺彂鍦烘櫙涓嬫寜鎺ュ彛鍔犻攣锛岀‘淇濆悓涓€鎺ュ彛鐨勯檺棰戦€昏緫绾跨▼瀹夊叏
         self._api_locks: Dict[str, threading.Lock] = {}
 
-        # 初始化每个接口的请求历史记录
+        # 鍒濆鍖栨瘡涓帴鍙ｇ殑璇锋眰鍘嗗彶璁板綍
         for api_name in self.RATE_LIMITS.keys():
             self.request_history[api_name] = deque(maxlen=1000)
             self._api_locks[api_name] = threading.Lock()
 
-            # 设置当前速率
+            # 璁剧疆褰撳墠閫熺巼
             self.RATE_LIMITS[api_name]['current'] = self.RATE_LIMITS[api_name][self.mode]
 
-        logger.info(f"API频率限制器初始化完成 (模式: {self.mode})")
+        logger.info(f"API棰戠巼闄愬埗鍣ㄥ垵濮嬪寲瀹屾垚 (妯″紡: {self.mode})")
 
     def _get_interval(self, api_name: str) -> float:
         """
-        计算两个请求之间的最小间隔时间（秒）
+        璁＄畻涓や釜璇锋眰涔嬮棿鐨勬渶灏忛棿闅旀椂闂达紙绉掞級
 
-        参数：
-            api_name: 接口名称
+        鍙傛暟锛?            api_name: 鎺ュ彛鍚嶇О
 
-        返回：
-            最小间隔时间（秒）
+        杩斿洖锛?            鏈€灏忛棿闅旀椂闂达紙绉掞級
         """
         if api_name not in self.RATE_LIMITS:
-            return 2.0  # 默认2秒间隔
-
+            return 2.0  # 榛樿2绉掗棿闅?
         rate_per_minute = self.RATE_LIMITS[api_name]['current']
         interval = 60.0 / rate_per_minute
 
-        # 添加10%的安全余量
-        interval *= 1.1
+        # 娣诲姞10%鐨勫畨鍏ㄤ綑閲?        interval *= 1.1
 
         return interval
 
     def wait_if_needed(self, api_name: str):
         """
-        如果需要，等待直到可以发送下一个请求
-
-        参数：
-            api_name: 接口名称
+        濡傛灉闇€瑕侊紝绛夊緟鐩村埌鍙互鍙戦€佷笅涓€涓姹?
+        鍙傛暟锛?            api_name: 鎺ュ彛鍚嶇О
         """
         if api_name not in self.request_history:
             return
@@ -172,45 +151,39 @@ class APIRateLimiter:
 
             if elapsed < interval:
                 wait_time = interval - elapsed
-                logger.debug(f"[{api_name}] 等待 {wait_time:.2f} 秒以符合频率限制")
+                logger.debug(f"[{api_name}] 绛夊緟 {wait_time:.2f} 绉掍互绗﹀悎棰戠巼闄愬埗")
                 time.sleep(wait_time)
 
     def record_request(self, api_name: str):
-        """记录一次API请求"""
+        """璁板綍涓€娆PI璇锋眰"""
         if api_name in self.request_history:
             self.request_history[api_name].append(time.time())
 
     def execute_with_rate_limit(self, api_name: str, func, *args, **kwargs):
         """
-        在频率限制下执行API调用，支持自动重试
+        鍦ㄩ鐜囬檺鍒朵笅鎵цAPI璋冪敤锛屾敮鎸佽嚜鍔ㄩ噸璇?
+        鍙傛暟锛?            api_name: 鎺ュ彛鍚嶇О
+            func: 瑕佹墽琛岀殑鍑芥暟
+            *args, **kwargs: 鍑芥暟鍙傛暟
 
-        参数：
-            api_name: 接口名称
-            func: 要执行的函数
-            *args, **kwargs: 函数参数
+        杩斿洖锛?            鍑芥暟鎵ц缁撴灉
 
-        返回：
-            函数执行结果
-
-        异常：
-            连续重试失败后抛出最后一个异常
-        """
+        寮傚父锛?            杩炵画閲嶈瘯澶辫触鍚庢姏鍑烘渶鍚庝竴涓紓甯?        """
         last_exception = None
 
         for attempt in range(self.MAX_RETRIES):
             try:
-                # 并发场景：同一接口串行节流，避免竞争导致的超频
+                # 骞跺彂鍦烘櫙锛氬悓涓€鎺ュ彛涓茶鑺傛祦锛岄伩鍏嶇珵浜夊鑷寸殑瓒呴
                 api_lock = self._api_locks.get(api_name)
                 if api_lock is None:
                     api_lock = threading.Lock()
                     self._api_locks[api_name] = api_lock
                 with api_lock:
-                    # 等待直到可以发送请求
-                    self.wait_if_needed(api_name)
-                    # 记录请求时间
+                    # 绛夊緟鐩村埌鍙互鍙戦€佽姹?                    self.wait_if_needed(api_name)
+                    # 璁板綍璇锋眰鏃堕棿
                     self.record_request(api_name)
 
-                # 执行实际的API调用
+                # 鎵ц瀹為檯鐨凙PI璋冪敤
                 result = func(*args, **kwargs)
 
                 return result
@@ -219,50 +192,48 @@ class APIRateLimiter:
                 last_exception = e
                 error_msg = str(e).lower()
 
-                # 检查是否是频率限制错误
+                # 妫€鏌ユ槸鍚︽槸棰戠巼闄愬埗閿欒
                 is_rate_limit_error = any(keyword in error_msg for keyword in [
-                    'limit', 'too many', '频率', '限流', '请求过快'
+                    'limit', 'too many', '棰戠巼', '闄愭祦', '璇锋眰杩囧揩'
                 ])
 
                 if is_rate_limit_error and attempt < self.MAX_RETRIES - 1:
-                    # 如果是频率限制错误，增加等待时间并重试
-                    delay = self.RETRY_DELAYS[min(attempt, len(self.RETRY_DELAYS)-1)]
+                    # 濡傛灉鏄鐜囬檺鍒堕敊璇紝澧炲姞绛夊緟鏃堕棿骞堕噸璇?                    delay = self.RETRY_DELAYS[min(attempt, len(self.RETRY_DELAYS)-1)]
                     logger.warning(
-                        f"[{api_name}] 可能触发频率限制 ({attempt+1}/{self.MAX_RETRIES}): {e}"
-                        f"\n   等待 {delay} 秒后重试..."
+                        f"[{api_name}] 鍙兘瑙﹀彂棰戠巼闄愬埗 ({attempt+1}/{self.MAX_RETRIES}): {e}"
+                        f"\n   绛夊緟 {delay} 绉掑悗閲嶈瘯..."
                     )
                     time.sleep(delay)
 
-                    # 动态降低该接口的速率
+                    # 鍔ㄦ€侀檷浣庤鎺ュ彛鐨勯€熺巼
                     if api_name in self.RATE_LIMITS:
                         current_rate = self.RATE_LIMITS[api_name]['current']
-                        new_rate = max(5, current_rate * 0.7)  # 降低30%，最低5次/分钟
+                        new_rate = max(5, current_rate * 0.7)  # 闄嶄綆30%锛屾渶浣?娆?鍒嗛挓
                         self.RATE_LIMITS[api_name]['current'] = new_rate
                         logger.info(
-                            f"[{api_name}] 自动降低速率: "
-                            f"{current_rate:.1f} -> {new_rate:.1f} 次/分钟"
+                            f"[{api_name}] 鑷姩闄嶄綆閫熺巼: "
+                            f"{current_rate:.1f} -> {new_rate:.1f} 娆?鍒嗛挓"
                         )
 
                 elif attempt < self.MAX_RETRIES - 1:
-                    # 其他错误，正常重试
-                    delay = self.RETRY_DELAYS[min(attempt, len(self.RETRY_DELAYS)-1)]
+                    # 鍏朵粬閿欒锛屾甯搁噸璇?                    delay = self.RETRY_DELAYS[min(attempt, len(self.RETRY_DELAYS)-1)]
                     logger.warning(
-                        f"[{api_name}] 请求失败 ({attempt+1}/{self.MAX_RETRIES}): {e}"
-                        f"\n   等待 {delay} 秒后重试..."
+                        f"[{api_name}] 璇锋眰澶辫触 ({attempt+1}/{self.MAX_RETRIES}): {e}"
+                        f"\n   绛夊緟 {delay} 绉掑悗閲嶈瘯..."
                     )
                     time.sleep(delay)
 
-        # 所有重试都失败
-        logger.error(f"[{api_name}] 经过 {self.MAX_RETRIES} 次重试后仍然失败")
+        # 鎵€鏈夐噸璇曢兘澶辫触
+        logger.error(f"[{api_name}] 缁忚繃 {self.MAX_RETRIES} 娆￠噸璇曞悗浠嶇劧澶辫触")
         raise last_exception
 
     def get_stats(self) -> Dict:
-        """获取统计信息"""
+        """鑾峰彇缁熻淇℃伅"""
         stats = {}
         now = time.time()
 
         for api_name, history in self.request_history.items():
-            # 统计最近1分钟的请求数
+            # 缁熻鏈€杩?鍒嗛挓鐨勮姹傛暟
             recent_count = sum(1 for t in history if now - t <= 60)
             rate_limit = self.RATE_LIMITS[api_name]['current']
 
@@ -277,28 +248,25 @@ class APIRateLimiter:
 
 def get_tushare_token() -> Optional[str]:
     """
-    获取Tushare Token（按优先级）
+    鑾峰彇Tushare Token锛堟寜浼樺厛绾э級
 
-    优先级顺序：
-    1. 命令行参数 --token
-    2. 环境变量 TUSHARE_API_KEY
-    3. 环境变量 TUSHARE_TOKEN
-    4. 配置文件 config/secrets.yaml
+    浼樺厛绾ч『搴忥細
+    1. 鍛戒护琛屽弬鏁?--token
+    2. 鐜鍙橀噺 TUSHARE_API_KEY
+    3. 鐜鍙橀噺 TUSHARE_TOKEN
+    4. 閰嶇疆鏂囦欢 config/secrets.yaml
 
-    返回：
-        Token字符串或None
+    杩斿洖锛?        Token瀛楃涓叉垨None
     """
 
-    # 方法1 & 2: 由main()函数处理命令行参数和环境变量
-    # 这里只处理备用方法
-
-    # 方法3: 环境变量 TUSHARE_TOKEN（兼容旧版本）
-    token = os.environ.get('TUSHARE_TOKEN', '').strip()
+    # 鏂规硶1 & 2: 鐢眒ain()鍑芥暟澶勭悊鍛戒护琛屽弬鏁板拰鐜鍙橀噺
+    # 杩欓噷鍙鐞嗗鐢ㄦ柟娉?
+    # 鏂规硶3: 鐜鍙橀噺 TUSHARE_TOKEN锛堝吋瀹规棫鐗堟湰锛?    token = os.environ.get('TUSHARE_TOKEN', '').strip()
     if token:
-        logger.info("从环境变量 TUSHARE_TOKEN 获取到Token")
+        logger.info("浠庣幆澧冨彉閲?TUSHARE_TOKEN 鑾峰彇鍒癟oken")
         return token
 
-    # 方法4: 配置文件
+    # 鏂规硶4: 閰嶇疆鏂囦欢
     try:
         import yaml
         config_path = Path('config/secrets.yaml')
@@ -308,7 +276,7 @@ def get_tushare_token() -> Optional[str]:
                 if data and 'tushare' in data:
                     token = data['tushare'].get('token', '').strip()
                     if token:
-                        logger.info("从配置文件 config/secrets.yaml 获取到Token")
+                        logger.info("浠庨厤缃枃浠?config/secrets.yaml 鑾峰彇鍒癟oken")
                         return token
     except Exception:
         pass
@@ -317,7 +285,7 @@ def get_tushare_token() -> Optional[str]:
 
 
 class TushareDataFetcher:
-    """Tushare数据获取器（集成API频率限制）"""
+    """Tushare鏁版嵁鑾峰彇鍣紙闆嗘垚API棰戠巼闄愬埗锛?""
 
     def __init__(self, token: str, cache_dir: str = "data/tushare_cache",
                  rate_limiter: APIRateLimiter = None):
@@ -330,16 +298,16 @@ class TushareDataFetcher:
             import tushare as ts
             self.ts = ts
             self.pro = ts.pro_api(token)
-            logger.info("Tushare Pro API 初始化成功")
+            logger.info("Tushare Pro API 鍒濆鍖栨垚鍔?)
         except Exception as e:
-            logger.error(f"初始化Tushare失败: {e}")
+            logger.error(f"鍒濆鍖朤ushare澶辫触: {e}")
             raise
 
     def _cache_path(self, name: str) -> Path:
         return self.cache_dir / name
 
     def _load_cache(self, name: str) -> Optional[pd.DataFrame]:
-        """加载缓存数据"""
+        """鍔犺浇缂撳瓨鏁版嵁"""
         p = self._cache_path(name)
         if p.exists():
             try:
@@ -352,7 +320,7 @@ class TushareDataFetcher:
         return None
 
     def _save_cache(self, name: str, df: pd.DataFrame):
-        """保存缓存数据"""
+        """淇濆瓨缂撳瓨鏁版嵁"""
         p = self._cache_path(name)
         try:
             df.to_parquet(p, index=False)
@@ -360,12 +328,11 @@ class TushareDataFetcher:
             df.to_csv(p.with_suffix('.csv'), index=False)
 
     def get_stock_list(self) -> pd.DataFrame:
-        """获取股票列表"""
+        """鑾峰彇鑲＄エ鍒楄〃"""
         cache_name = "stock_list.parquet"
         cached = self._load_cache(cache_name)
 
-        # 安全检查缓存数据
-        if cached is not None and len(cached) > 0:
+        # 瀹夊叏妫€鏌ョ紦瀛樻暟鎹?        if cached is not None and len(cached) > 0:
             return cached
 
         def _fetch():
@@ -379,8 +346,7 @@ class TushareDataFetcher:
         else:
             df = _fetch()
 
-        # 安全检查返回数据
-        if df is not None and len(df) > 0:
+        # 瀹夊叏妫€鏌ヨ繑鍥炴暟鎹?        if df is not None and len(df) > 0:
             self._save_cache(cache_name, df)
 
         return df if df is not None else pd.DataFrame()
@@ -388,21 +354,19 @@ class TushareDataFetcher:
     def get_stk_factor_pro(self, ts_code: str, start_date: str, end_date: str,
                            fields: List[str]) -> pd.DataFrame:
         """
-        获取技术面因子数据 (stk_factor_pro接口)
+        鑾峰彇鎶€鏈潰鍥犲瓙鏁版嵁 (stk_factor_pro鎺ュ彛)
 
-        频率限制：5000积分=30次/分钟, 8000+积分=500次/分钟
+        棰戠巼闄愬埗锛?000绉垎=30娆?鍒嗛挓, 8000+绉垎=500娆?鍒嗛挓
 
-        参数：
-            ts_code: 股票代码
-            start_date: 开始日期 (YYYYMMDD)
-            end_date: 结束日期 (YYYYMMDD)
-            fields: 需要的字段列表
+        鍙傛暟锛?            ts_code: 鑲＄エ浠ｇ爜
+            start_date: 寮€濮嬫棩鏈?(YYYYMMDD)
+            end_date: 缁撴潫鏃ユ湡 (YYYYMMDD)
+            fields: 闇€瑕佺殑瀛楁鍒楄〃
         """
         cache_name = f"stk_factor_{ts_code}_{start_date}_{end_date}.parquet"
         cached = self._load_cache(cache_name)
 
-        # 安全检查缓存数据
-        if cached is not None and len(cached) > 0:
+        # 瀹夊叏妫€鏌ョ紦瀛樻暟鎹?        if cached is not None and len(cached) > 0:
             return cached
 
         field_str = ','.join(fields)
@@ -421,52 +385,47 @@ class TushareDataFetcher:
             else:
                 df = _fetch()
 
-            # 调试日志：显示返回数据的类型和形状
-            logger.debug(f"[{ts_code}] stk_factor_pro 返回类型: {type(df)}, 值: {df}")
+            # 璋冭瘯鏃ュ織锛氭樉绀鸿繑鍥炴暟鎹殑绫诲瀷鍜屽舰鐘?            logger.debug(f"[{ts_code}] stk_factor_pro 杩斿洖绫诲瀷: {type(df)}, 鍊? {df}")
 
-            # 安全检查：确保df是有效的DataFrame
+            # 瀹夊叏妫€鏌ワ細纭繚df鏄湁鏁堢殑DataFrame
             if df is None:
-                logger.debug(f"[{ts_code}] stk_factor_pro 返回None")
+                logger.debug(f"[{ts_code}] stk_factor_pro 杩斿洖None")
                 return pd.DataFrame()
 
-            # 转换为DataFrame（防止返回Series或其他类型）
+            # 杞崲涓篋ataFrame锛堥槻姝㈣繑鍥濻eries鎴栧叾浠栫被鍨嬶級
             if not isinstance(df, pd.DataFrame):
-                logger.warning(f"[{ts_code}] stk_factor_pro 返回非DataFrame类型: {type(df)}，尝试转换")
+                logger.warning(f"[{ts_code}] stk_factor_pro 杩斿洖闈濪ataFrame绫诲瀷: {type(df)}锛屽皾璇曡浆鎹?)
                 df = pd.DataFrame(df)
 
-            # 检查是否为空
-            if len(df) > 0:
-                logger.info(f"  ✅ 获取到 {ts_code} 技术因子数据，共 {len(df)} 条记录")
+            # 妫€鏌ユ槸鍚︿负绌?            if len(df) > 0:
+                logger.info(f"  鉁?鑾峰彇鍒?{ts_code} 鎶€鏈洜瀛愭暟鎹紝鍏?{len(df)} 鏉¤褰?)
                 self._save_cache(cache_name, df)
             else:
-                logger.info(f"  ⚠️  {ts_code} 技术因子数据为空（可能该时间段无数据）")
+                logger.info(f"  鈿狅笍  {ts_code} 鎶€鏈洜瀛愭暟鎹负绌猴紙鍙兘璇ユ椂闂存鏃犳暟鎹級")
 
             return df
 
         except Exception as e:
-            logger.warning(f"获取 {ts_code} 技术因子失败: {e}")
+            logger.warning(f"鑾峰彇 {ts_code} 鎶€鏈洜瀛愬け璐? {e}")
             import traceback
-            logger.debug(f"详细错误信息:\n{traceback.format_exc()}")
+            logger.debug(f"璇︾粏閿欒淇℃伅:\n{traceback.format_exc()}")
             return pd.DataFrame()
 
     def get_moneyflow_dc(self, ts_code: str, start_date: str, end_date: str,
                          fields: List[str]) -> pd.DataFrame:
         """
-        获取个股资金流向数据 (moneyflow_dc接口)
+        鑾峰彇涓偂璧勯噾娴佸悜鏁版嵁 (moneyflow_dc鎺ュ彛)
 
-        频率限制：保守估计30次/分钟（需要5000+积分）
-
-        参数：
-            ts_code: 股票代码
-            start_date: 开始日期 (YYYYMMDD)
-            end_date: 结束日期 (YYYYMMDD)
-            fields: 需要的字段列表
+        棰戠巼闄愬埗锛氫繚瀹堜及璁?0娆?鍒嗛挓锛堥渶瑕?000+绉垎锛?
+        鍙傛暟锛?            ts_code: 鑲＄エ浠ｇ爜
+            start_date: 寮€濮嬫棩鏈?(YYYYMMDD)
+            end_date: 缁撴潫鏃ユ湡 (YYYYMMDD)
+            fields: 闇€瑕佺殑瀛楁鍒楄〃
         """
         cache_name = f"moneyflow_{ts_code}_{start_date}_{end_date}.parquet"
         cached = self._load_cache(cache_name)
 
-        # 安全检查缓存数据
-        if cached is not None and len(cached) > 0:
+        # 瀹夊叏妫€鏌ョ紦瀛樻暟鎹?        if cached is not None and len(cached) > 0:
             return cached
 
         field_str = ','.join(fields)
@@ -485,42 +444,38 @@ class TushareDataFetcher:
             else:
                 df = _fetch()
 
-            # 安全检查：确保df是有效的DataFrame
+            # 瀹夊叏妫€鏌ワ細纭繚df鏄湁鏁堢殑DataFrame
             if df is None:
                 return pd.DataFrame()
 
-            # 转换为DataFrame（防止返回Series或其他类型）
+            # 杞崲涓篋ataFrame锛堥槻姝㈣繑鍥濻eries鎴栧叾浠栫被鍨嬶級
             if not isinstance(df, pd.DataFrame):
                 df = pd.DataFrame(df)
 
-            # 检查是否为空
-            if len(df) > 0:
+            # 妫€鏌ユ槸鍚︿负绌?            if len(df) > 0:
                 self._save_cache(cache_name, df)
 
             return df
 
         except Exception as e:
-            logger.warning(f"获取 {ts_code} 资金流向失败: {e}")
+            logger.warning(f"鑾峰彇 {ts_code} 璧勯噾娴佸悜澶辫触: {e}")
             return pd.DataFrame()
 
     def get_margin_detail(self, ts_code: str, start_date: str, end_date: str,
                           fields: List[str]) -> pd.DataFrame:
         """
-        获取融资融券交易明细 (margin_detail接口)
+        鑾峰彇铻嶈祫铻嶅埜浜ゆ槗鏄庣粏 (margin_detail鎺ュ彛)
 
-        频率限制：保守估计30次/分钟（需要2000+积分）
-
-        参数：
-            ts_code: 股票代码
-            start_date: 开始日期 (YYYYMMDD)
-            end_date: 结束日期 (YYYYMMDD)
-            fields: 需要的字段列表
+        棰戠巼闄愬埗锛氫繚瀹堜及璁?0娆?鍒嗛挓锛堥渶瑕?000+绉垎锛?
+        鍙傛暟锛?            ts_code: 鑲＄エ浠ｇ爜
+            start_date: 寮€濮嬫棩鏈?(YYYYMMDD)
+            end_date: 缁撴潫鏃ユ湡 (YYYYMMDD)
+            fields: 闇€瑕佺殑瀛楁鍒楄〃
         """
         cache_name = f"margin_{ts_code}_{start_date}_{end_date}.parquet"
         cached = self._load_cache(cache_name)
 
-        # 安全检查缓存数据
-        if cached is not None and len(cached) > 0:
+        # 瀹夊叏妫€鏌ョ紦瀛樻暟鎹?        if cached is not None and len(cached) > 0:
             return cached
 
         field_str = ','.join(fields)
@@ -539,44 +494,40 @@ class TushareDataFetcher:
             else:
                 df = _fetch()
 
-            # 安全检查：确保df是有效的DataFrame
+            # 瀹夊叏妫€鏌ワ細纭繚df鏄湁鏁堢殑DataFrame
             if df is None:
                 return pd.DataFrame()
 
-            # 转换为DataFrame（防止返回Series或其他类型）
+            # 杞崲涓篋ataFrame锛堥槻姝㈣繑鍥濻eries鎴栧叾浠栫被鍨嬶級
             if not isinstance(df, pd.DataFrame):
                 df = pd.DataFrame(df)
 
-            # 检查是否为空
-            if len(df) > 0:
+            # 妫€鏌ユ槸鍚︿负绌?            if len(df) > 0:
                 self._save_cache(cache_name, df)
 
             return df
 
         except Exception as e:
-            logger.warning(f"获取 {ts_code} 融资融券数据失败: {e}")
+            logger.warning(f"鑾峰彇 {ts_code} 铻嶈祫铻嶅埜鏁版嵁澶辫触: {e}")
             return pd.DataFrame()
 
     def get_fina_indicator(self, ts_code: str, start_date: str, end_date: str,
                            fields: List[str]) -> pd.DataFrame:
         """
-        获取财务指标数据 (fina_indicator接口)
+        鑾峰彇璐㈠姟鎸囨爣鏁版嵁 (fina_indicator鎺ュ彛)
 
-        频率限制：保守估计20次/分钟（需要2000+积分，按股票查询）
+        棰戠巼闄愬埗锛氫繚瀹堜及璁?0娆?鍒嗛挓锛堥渶瑕?000+绉垎锛屾寜鑲＄エ鏌ヨ锛?
+        娉ㄦ剰锛氭鎺ュ彛姣忔鏈€澶氳繑鍥?00鏉¤褰曪紝涓斿彧鑳芥寜鍗曞彧鑲＄エ鏌ヨ
 
-        注意：此接口每次最多返回100条记录，且只能按单只股票查询
-
-        参数：
-            ts_code: 股票代码
-            start_date: 开始日期 (YYYYMMDD)
-            end_date: 结束日期 (YYYYMMDD)
-            fields: 需要的字段列表
+        鍙傛暟锛?            ts_code: 鑲＄エ浠ｇ爜
+            start_date: 寮€濮嬫棩鏈?(YYYYMMDD)
+            end_date: 缁撴潫鏃ユ湡 (YYYYMMDD)
+            fields: 闇€瑕佺殑瀛楁鍒楄〃
         """
         cache_name = f"fina_ind_{ts_code}_{start_date}_{end_date}.parquet"
         cached = self._load_cache(cache_name)
 
-        # 安全检查缓存数据
-        if cached is not None and len(cached) > 0:
+        # 瀹夊叏妫€鏌ョ紦瀛樻暟鎹?        if cached is not None and len(cached) > 0:
             return cached
 
         field_str = ','.join(fields)
@@ -595,34 +546,32 @@ class TushareDataFetcher:
             else:
                 df = _fetch()
 
-            # 安全检查：确保df是有效的DataFrame
+            # 瀹夊叏妫€鏌ワ細纭繚df鏄湁鏁堢殑DataFrame
             if df is None:
                 return pd.DataFrame()
 
-            # 转换为DataFrame（防止返回Series或其他类型）
+            # 杞崲涓篋ataFrame锛堥槻姝㈣繑鍥濻eries鎴栧叾浠栫被鍨嬶級
             if not isinstance(df, pd.DataFrame):
                 df = pd.DataFrame(df)
 
-            # 检查是否为空
-            if len(df) > 0:
+            # 妫€鏌ユ槸鍚︿负绌?            if len(df) > 0:
                 self._save_cache(cache_name, df)
 
             return df
 
         except Exception as e:
-            logger.warning(f"获取 {ts_code} 财务指标失败: {e}")
+            logger.warning(f"鑾峰彇 {ts_code} 璐㈠姟鎸囨爣澶辫触: {e}")
             return pd.DataFrame()
 
 
 class QlibDataConverter:
-    """Qlib格式数据转换器"""
+    """Qlib鏍煎紡鏁版嵁杞崲鍣?""
 
     def __init__(self, output_dir: str):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # 创建Qlib所需的目录结构
-        self.calendars_dir = self.output_dir / 'calendars'
+        # 鍒涘缓Qlib鎵€闇€鐨勭洰褰曠粨鏋?        self.calendars_dir = self.output_dir / 'calendars'
         self.features_dir = self.output_dir / 'features'
         self.instruments_dir = self.output_dir / 'instruments'
 
@@ -630,15 +579,13 @@ class QlibDataConverter:
         self.features_dir.mkdir(exist_ok=True)
         self.instruments_dir.mkdir(exist_ok=True)
 
-        logger.info(f"Qlib数据输出目录: {self.output_dir}")
+        logger.info(f"Qlib鏁版嵁杈撳嚭鐩綍: {self.output_dir}")
 
     def save_calendar(self, dates: List[pd.Timestamp], freq: str = 'day'):
         """
-        保存交易日历
+        淇濆瓨浜ゆ槗鏃ュ巻
 
-        参数：
-            dates: 交易日列表
-            freq: 频率 (day/min等)
+        鍙傛暟锛?            dates: 浜ゆ槗鏃ュ垪琛?            freq: 棰戠巼 (day/min绛?
         """
         calendar_path = self.calendars_dir / f'{freq}.txt'
 
@@ -646,16 +593,13 @@ class QlibDataConverter:
         with open(calendar_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(date_strings))
 
-        logger.info(f"交易日历已保存: {calendar_path}, 共 {len(date_strings)} 个交易日")
+        logger.info(f"浜ゆ槗鏃ュ巻宸蹭繚瀛? {calendar_path}, 鍏?{len(date_strings)} 涓氦鏄撴棩")
 
     def save_instruments(self, stock_list: pd.DataFrame, start_date: str, end_date: str):
         """
-        保存股票池信息
-
-        参数：
-            stock_list: 股票列表DataFrame
-            start_date: 开始日期
-            end_date: 结束日期
+        淇濆瓨鑲＄エ姹犱俊鎭?
+        鍙傛暟锛?            stock_list: 鑲＄エ鍒楄〃DataFrame
+            start_date: 寮€濮嬫棩鏈?            end_date: 缁撴潫鏃ユ湡
         """
         instruments_path = self.instruments_dir / 'all.txt'
 
@@ -666,7 +610,7 @@ class QlibDataConverter:
                 line = f"{ts_code}\t{list_date}\t{end_date}\n"
                 f.write(line)
 
-        logger.info(f"股票池信息已保存: {instruments_path}, 共 {len(stock_list)} 只股票")
+        logger.info(f"鑲＄エ姹犱俊鎭凡淇濆瓨: {instruments_path}, 鍏?{len(stock_list)} 鍙偂绁?)
 
     def dataframe_to_bin(
         self,
@@ -676,47 +620,38 @@ class QlibDataConverter:
         source_field: Optional[str] = None,
     ):
         """
-        将单个字段的数据转换为bin格式
+        灏嗗崟涓瓧娈电殑鏁版嵁杞崲涓篵in鏍煎紡
 
-        Qlib bin格式说明：
-        - 第一行是日期索引（在日历中的位置）
-        - 后续是实际数据值
-        - 数据类型：float32（小端序）
-
-        参数：
-            df: DataFrame，包含datetime索引和目标字段
-            field: 输出 bin 文件名所用字段名（如 open）
-            freq: 频率
-            source_field: 若指定，从该列读取数值，仍写入 field 对应的 .bin 文件
+        Qlib bin鏍煎紡璇存槑锛?        - 绗竴琛屾槸鏃ユ湡绱㈠紩锛堝湪鏃ュ巻涓殑浣嶇疆锛?        - 鍚庣画鏄疄闄呮暟鎹€?        - 鏁版嵁绫诲瀷锛歠loat32锛堝皬绔簭锛?
+        鍙傛暟锛?            df: DataFrame锛屽寘鍚玠atetime绱㈠紩鍜岀洰鏍囧瓧娈?            field: 杈撳嚭 bin 鏂囦欢鍚嶆墍鐢ㄥ瓧娈靛悕锛堝 open锛?            freq: 棰戠巼
+            source_field: 鑻ユ寚瀹氾紝浠庤鍒楄鍙栨暟鍊硷紝浠嶅啓鍏?field 瀵瑰簲鐨?.bin 鏂囦欢
         """
         col = source_field if source_field is not None else field
         if col not in df.columns:
-            logger.warning(f"字段 {col} 不存在")
+            logger.warning(f"瀛楁 {col} 涓嶅瓨鍦?)
             return
 
         bin_path = self.features_dir / f"{field.lower()}.{freq}.bin"
 
-        # 准备数据：确保有datetime索引
+        # 鍑嗗鏁版嵁锛氱‘淇濇湁datetime绱㈠紩
         data = df[col].dropna()
 
         if len(data) == 0:
-            logger.warning(f"字段 {field} 没有有效数据")
+            logger.warning(f"瀛楁 {field} 娌℃湁鏈夋晥鏁版嵁")
             return
 
-        # 读取日历以建立索引映射
-        calendar_path = self.calendars_dir / f'{freq}.txt'
+        # 璇诲彇鏃ュ巻浠ュ缓绔嬬储寮曟槧灏?        calendar_path = self.calendars_dir / f'{freq}.txt'
         if not calendar_path.exists():
-            logger.error("请先保存交易日历")
+            logger.error("璇峰厛淇濆瓨浜ゆ槗鏃ュ巻")
             return
 
         with open(calendar_path, 'r', encoding='utf-8') as f:
             calendar_dates = [line.strip() for line in f.readlines()]
 
-        # 创建日期到索引的映射
+        # 鍒涘缓鏃ユ湡鍒扮储寮曠殑鏄犲皠
         date_to_idx = {date: idx for idx, date in enumerate(calendar_dates)}
 
-        # 为每个数据点找到对应的日历索引
-        indices = []
+        # 涓烘瘡涓暟鎹偣鎵惧埌瀵瑰簲鐨勬棩鍘嗙储寮?        indices = []
         values = []
 
         for dt, val in data.items():
@@ -727,43 +662,37 @@ class QlibDataConverter:
                     values.append(float(val))
 
         if len(indices) == 0:
-            logger.warning(f"字段 {field} 没有匹配到交易日历的数据")
+            logger.warning(f"瀛楁 {field} 娌℃湁鍖归厤鍒颁氦鏄撴棩鍘嗙殑鏁版嵁")
             return
 
-        # 创建数组：第一列是日期索引，第二列是值
-        output_array = np.column_stack([indices, values]).astype('<f')
+        # 鍒涘缓鏁扮粍锛氱涓€鍒楁槸鏃ユ湡绱㈠紩锛岀浜屽垪鏄€?        output_array = np.column_stack([indices, values]).astype('<f')
 
-        # 写入bin文件
+        # 鍐欏叆bin鏂囦欢
         output_array.tofile(str(bin_path.resolve()))
 
-        logger.debug(f"字段 {field} 已转换为bin格式: {len(values)} 条记录")
+        logger.debug(f"瀛楁 {field} 宸茶浆鎹负bin鏍煎紡: {len(values)} 鏉¤褰?)
 
     def convert_and_save(self, merged_df: pd.DataFrame, stock_list: pd.DataFrame,
                          start_date: str, end_date: str):
         """
-        将合并后的数据转换为Qlib格式并保存
-
-        参数：
-            merged_df: 合并后的DataFrame（包含所有字段）
-            stock_list: 股票列表
-            start_date: 开始日期
-            end_date: 结束日期
+        灏嗗悎骞跺悗鐨勬暟鎹浆鎹负Qlib鏍煎紡骞朵繚瀛?
+        鍙傛暟锛?            merged_df: 鍚堝苟鍚庣殑DataFrame锛堝寘鍚墍鏈夊瓧娈碉級
+            stock_list: 鑲＄エ鍒楄〃
+            start_date: 寮€濮嬫棩鏈?            end_date: 缁撴潫鏃ユ湡
         """
-        logger.info("开始转换为Qlib格式...")
+        logger.info("寮€濮嬭浆鎹负Qlib鏍煎紡...")
 
-        # 1. 保存交易日历
+        # 1. 淇濆瓨浜ゆ槗鏃ュ巻
         dates = pd.to_datetime(merged_df.index.get_level_values('datetime').unique()).sort_values()
         self.save_calendar(dates.tolist())
 
-        # 2. 保存股票池信息
-        self.save_instruments(stock_list, start_date, end_date)
+        # 2. 淇濆瓨鑲＄エ姹犱俊鎭?        self.save_instruments(stock_list, start_date, end_date)
 
-        # 3. 逐个字段转换为bin格式
-        # 基础OHLCV字段
+        # 3. 閫愪釜瀛楁杞崲涓篵in鏍煎紡
+        # 鍩虹OHLCV瀛楁
         base_fields = ['open_qfq', 'high_qfq', 'low_qfq', 'close_qfq', 'vol', 'amount']
 
-        # 扩展技术指标字段
-        tech_fields = [
+        # 鎵╁睍鎶€鏈寚鏍囧瓧娈?        tech_fields = [
             'turnover_rate', 'volume_ratio', 'pe', 'pb', 'ps', 'dv_ratio',
             'ps_ttm', 'pe_ttm', 'dv_ttm', 'total_mv',
             'kdj_qfq', 'kdj_d_qfq', 'kdj_k_qfq', 'rsi_qfq_12',
@@ -771,16 +700,16 @@ class QlibDataConverter:
             'turnover_rate_f'
         ]
 
-        # 资金流向字段
+        # 璧勯噾娴佸悜瀛楁
         money_fields = [
             'net_amount', 'buy_elg_amount', 'buy_lg_amount',
             'buy_md_amount', 'buy_sm_amount'
         ]
 
-        # 融资融券字段
+        # 铻嶈祫铻嶅埜瀛楁
         margin_fields = ['rzye', 'rqye']
 
-        # 财务指标字段
+        # 璐㈠姟鎸囨爣瀛楁
         fina_fields = [
             'roe', 'roa', 'roa2_yearly', 'profit_to_gr',
             'q_profit_yoy', 'q_eps', 'assets_turn'
@@ -788,15 +717,15 @@ class QlibDataConverter:
 
         all_fields = base_fields + tech_fields + money_fields + margin_fields + fina_fields
 
-        # 过滤出实际存在的字段
+        # 杩囨护鍑哄疄闄呭瓨鍦ㄧ殑瀛楁
         available_fields = [f for f in all_fields if f in merged_df.columns]
-        logger.info(f"将转换 {len(available_fields)} 个字段")
+        logger.info(f"灏嗚浆鎹?{len(available_fields)} 涓瓧娈?)
 
         for field in available_fields:
             try:
                 self.dataframe_to_bin(merged_df, field)
             except Exception as e:
-                logger.error(f"转换字段 {field} 失败: {e}")
+                logger.error(f"杞崲瀛楁 {field} 澶辫触: {e}")
 
         for target, source in QLIB_STD_OHLCV_FROM.items():
             if source not in merged_df.columns:
@@ -804,15 +733,15 @@ class QlibDataConverter:
             try:
                 self.dataframe_to_bin(merged_df, target, freq='day', source_field=source)
             except Exception as e:
-                logger.error(f"转换标准字段 {target}（来自 {source}）失败: {e}")
+                logger.error(f"杞崲鏍囧噯瀛楁 {target}锛堟潵鑷?{source}锛夊け璐? {e}")
 
-        logger.info(f"Qlib格式转换完成！数据保存在: {self.output_dir}")
+        logger.info(f"Qlib鏍煎紡杞崲瀹屾垚锛佹暟鎹繚瀛樺湪: {self.output_dir}")
 
 
 class DataPipeline:
-    """数据处理管道：从Tushare获取数据并转换为Qlib格式（集成智能频率控制）"""
+    """鏁版嵁澶勭悊绠￠亾锛氫粠Tushare鑾峰彇鏁版嵁骞惰浆鎹负Qlib鏍煎紡锛堥泦鎴愭櫤鑳介鐜囨帶鍒讹級"""
 
-    # stk_factor_pro接口需要的字段
+    # stk_factor_pro鎺ュ彛闇€瑕佺殑瀛楁
     STK_FACTOR_FIELDS = [
         'ts_code', 'trade_date', 'open_qfq', 'high_qfq', 'low_qfq', 'close_qfq',
         'vol', 'amount', 'turnover_rate', 'volume_ratio', 'pe', 'pb', 'ps',
@@ -822,18 +751,18 @@ class DataPipeline:
         'turnover_rate_f'
     ]
 
-    # moneyflow_dc接口需要的字段
+    # moneyflow_dc鎺ュ彛闇€瑕佺殑瀛楁
     MONEYFLOW_FIELDS = [
         'trade_date', 'ts_code', 'net_amount', 'buy_elg_amount',
         'buy_lg_amount', 'buy_md_amount', 'buy_sm_amount'
     ]
 
-    # margin_detail接口需要的字段
+    # margin_detail鎺ュ彛闇€瑕佺殑瀛楁
     MARGIN_FIELDS = [
         'trade_date', 'ts_code', 'rzye', 'rqye'
     ]
 
-    # fina_indicator接口需要的字段
+    # fina_indicator鎺ュ彛闇€瑕佺殑瀛楁
     FINA_INDICATOR_FIELDS = [
         'ts_code', 'end_date', 'roe', 'roa', 'roa2_yearly',
         'profit_to_gr', 'q_profit_yoy', 'q_eps', 'assets_turn'
@@ -843,21 +772,15 @@ class DataPipeline:
                  max_stocks: int = None, high_speed: bool = False,
                  csv_dir: str = None, download_workers: int = 4):
         """
-        初始化数据管道
+        鍒濆鍖栨暟鎹閬?
+        鍙傛暟锛?            token: Tushare API token
+            output_dir: Qlib鏍煎紡杈撳嚭鐩綍
+            start_date: 寮€濮嬫棩鏈?(YYYYMMDD)
+            end_date: 缁撴潫鏃ユ湡 (YYYYMMDD)
+            max_stocks: 鏈€澶у鐞嗚偂绁ㄦ暟閲忥紙鐢ㄤ簬娴嬭瘯锛孨one琛ㄧず鍏ㄩ儴锛?            high_speed: 鏄惁鍚敤楂橀€熸ā寮忥紙闇€瑕?000+绉垎锛?            csv_dir: CSV鏂囦欢淇濆瓨鐩綍锛堥粯璁や负output_dir/csv_data锛?        """
+        # 鍒涘缓API棰戠巼闄愬埗鍣?        self.rate_limiter = APIRateLimiter(high_speed=high_speed)
 
-        参数：
-            token: Tushare API token
-            output_dir: Qlib格式输出目录
-            start_date: 开始日期 (YYYYMMDD)
-            end_date: 结束日期 (YYYYMMDD)
-            max_stocks: 最大处理股票数量（用于测试，None表示全部）
-            high_speed: 是否启用高速模式（需要8000+积分）
-            csv_dir: CSV文件保存目录（默认为output_dir/csv_data）
-        """
-        # 创建API频率限制器
-        self.rate_limiter = APIRateLimiter(high_speed=high_speed)
-
-        # 创建数据获取器（传入频率限制器）
+        # 鍒涘缓鏁版嵁鑾峰彇鍣紙浼犲叆棰戠巼闄愬埗鍣級
         self.fetcher = TushareDataFetcher(token, rate_limiter=self.rate_limiter)
         self.converter = QlibDataConverter(output_dir)
         self.start_date = start_date
@@ -865,24 +788,22 @@ class DataPipeline:
         self.max_stocks = max_stocks
         self.download_workers = max(1, int(download_workers))
 
-        # CSV数据目录（用于中间存储）
-        # 默认统一到固定目录，避免测试与正式流程路径不一致。
-        if csv_dir:
+        # CSV鏁版嵁鐩綍锛堢敤浜庝腑闂村瓨鍌級
+        # 榛樿缁熶竴鍒板浐瀹氱洰褰曪紝閬垮厤娴嬭瘯涓庢寮忔祦绋嬭矾寰勪笉涓€鑷淬€?        if csv_dir:
             self.csv_dir = Path(csv_dir)
         else:
             self.csv_dir = Path(r"D:\qlib_data\csv_data")
 
         self.csv_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"数据管道初始化完成 (高速模式: {high_speed})")
-        logger.info(f"CSV数据目录: {self.csv_dir}")
-        logger.info(f"Qlib输出目录: {self.converter.output_dir}")
-        logger.info(f"下载并发线程数: {self.download_workers}")
+        logger.info(f"鏁版嵁绠￠亾鍒濆鍖栧畬鎴?(楂橀€熸ā寮? {high_speed})")
+        logger.info(f"CSV鏁版嵁鐩綍: {self.csv_dir}")
+        logger.info(f"Qlib杈撳嚭鐩綍: {self.converter.output_dir}")
+        logger.info(f"涓嬭浇骞跺彂绾跨▼鏁? {self.download_workers}")
 
     def _download_single_stock(self, ts_code: str) -> str:
         """
-        下载并保存单只股票数据。
-        返回值：
+        涓嬭浇骞朵繚瀛樺崟鍙偂绁ㄦ暟鎹€?        杩斿洖鍊硷細
             "success" | "skip" | "fail"
         """
         try:
@@ -896,40 +817,38 @@ class DataPipeline:
                 return "fail"
             return "success" if self.save_stock_to_csv(ts_code, df) else "fail"
         except Exception as e:
-            logger.error(f"处理 {ts_code} 时出错: {e}")
+            logger.error(f"澶勭悊 {ts_code} 鏃跺嚭閿? {e}")
             return "fail"
 
     def fetch_all_data_for_stock(self, ts_code: str) -> pd.DataFrame:
         """
-        获取单只股票的所有数据并合并
+        鑾峰彇鍗曞彧鑲＄エ鐨勬墍鏈夋暟鎹苟鍚堝苟
 
-        参数：
-            ts_code: 股票代码
+        鍙傛暟锛?            ts_code: 鑲＄エ浠ｇ爜
 
-        返回：
-            合并后的DataFrame
+        杩斿洖锛?            鍚堝苟鍚庣殑DataFrame
         """
         logger.info(f"\n{'='*60}")
-        logger.info(f"正在处理股票: {ts_code}")
+        logger.info(f"姝ｅ湪澶勭悊鑲＄エ: {ts_code}")
         logger.info(f"{'='*60}")
 
-        # 1. 获取技术面因子数据
-        logger.info("  [1/4] 获取技术面因子数据...")
+        # 1. 鑾峰彇鎶€鏈潰鍥犲瓙鏁版嵁
+        logger.info("  [1/4] 鑾峰彇鎶€鏈潰鍥犲瓙鏁版嵁...")
         factor_df = self.fetcher.get_stk_factor_pro(
             ts_code, self.start_date, self.end_date,
             self.STK_FACTOR_FIELDS
         )
 
         if factor_df.empty:
-            logger.warning(f"  {ts_code} 无技术因子数据，跳过")
+            logger.warning(f"  {ts_code} 鏃犳妧鏈洜瀛愭暟鎹紝璺宠繃")
             return pd.DataFrame()
 
-        # 设置索引
+        # 璁剧疆绱㈠紩
         factor_df['datetime'] = pd.to_datetime(factor_df['trade_date'])
         factor_df.set_index(['datetime'], inplace=True)
 
-        # 2. 获取资金流向数据
-        logger.info("  [2/4] 获取资金流向数据...")
+        # 2. 鑾峰彇璧勯噾娴佸悜鏁版嵁
+        logger.info("  [2/4] 鑾峰彇璧勯噾娴佸悜鏁版嵁...")
         money_df = self.fetcher.get_moneyflow_dc(
             ts_code, self.start_date, self.end_date,
             self.MONEYFLOW_FIELDS
@@ -938,16 +857,16 @@ class DataPipeline:
         if not money_df.empty:
             money_df['datetime'] = pd.to_datetime(money_df['trade_date'])
             money_df.set_index(['datetime'], inplace=True)
-            # 合并资金流向数据
+            # 鍚堝苟璧勯噾娴佸悜鏁版嵁
             factor_df = factor_df.join(money_df[
                 ['net_amount', 'buy_elg_amount', 'buy_lg_amount',
                  'buy_md_amount', 'buy_sm_amount']
             ], how='left')
         else:
-            logger.info("  无资金流向数据")
+            logger.info("  鏃犺祫閲戞祦鍚戞暟鎹?)
 
-        # 3. 获取融资融券数据
-        logger.info("  [3/4] 获取融资融券数据...")
+        # 3. 鑾峰彇铻嶈祫铻嶅埜鏁版嵁
+        logger.info("  [3/4] 鑾峰彇铻嶈祫铻嶅埜鏁版嵁...")
         margin_df = self.fetcher.get_margin_detail(
             ts_code, self.start_date, self.end_date,
             self.MARGIN_FIELDS
@@ -956,47 +875,46 @@ class DataPipeline:
         if not margin_df.empty:
             margin_df['datetime'] = pd.to_datetime(margin_df['trade_date'])
             margin_df.set_index(['datetime'], inplace=True)
-            # 合并融资融券数据
+            # 鍚堝苟铻嶈祫铻嶅埜鏁版嵁
             factor_df = factor_df.join(margin_df[['rzye', 'rqye']], how='left')
         else:
-            logger.info("  无融资融券数据")
+            logger.info("  鏃犺瀺璧勮瀺鍒告暟鎹?)
 
-        # 4. 获取财务指标数据
-        logger.info("  [4/4] 获取财务指标数据...")
+        # 4. 鑾峰彇璐㈠姟鎸囨爣鏁版嵁
+        logger.info("  [4/4] 鑾峰彇璐㈠姟鎸囨爣鏁版嵁...")
         fina_df = self.fetcher.get_fina_indicator(
             ts_code, self.start_date, self.end_date,
             self.FINA_INDICATOR_FIELDS
         )
 
         if not fina_df.empty:
-            # 财务指标使用 end_date（报告期）作为日期
-            # 关键修复：规范化日期格式，确保只保留日期部分（不包含时间）
-            fina_df['datetime'] = pd.to_datetime(fina_df['end_date']).dt.normalize()
+            # 璐㈠姟鎸囨爣浣跨敤 end_date锛堟姤鍛婃湡锛変綔涓烘棩鏈?            # 鍏抽敭淇锛氳鑼冨寲鏃ユ湡鏍煎紡锛岀‘淇濆彧淇濈暀鏃ユ湡閮ㄥ垎锛堜笉鍖呭惈鏃堕棿锛?            fina_df['datetime'] = pd.to_datetime(fina_df['end_date']).dt.normalize()
             fina_df.set_index(['datetime'], inplace=True)
 
-            # 同样规范化factor_df的索引（确保日期格式一致）
+            # 鍚屾牱瑙勮寖鍖杅actor_df鐨勭储寮曪紙纭繚鏃ユ湡鏍煎紡涓€鑷达級
             factor_df_index = factor_df.index
             if hasattr(factor_df_index, 'to_frame'):
-                # MultiIndex情况，重置后再处理
                 pass
             else:
-                # 确保factor_df的datetime索引也是规范化的
-                factor_df.index = pd.to_datetime(factor_df.index).dt.normalize()
+                if isinstance(factor_df.index, pd.DatetimeIndex):
+                    factor_df.index = factor_df.index.normalize()
+                else:
+                    factor_df.index = pd.to_datetime(factor_df.index).dt.normalize()
 
-            # 合并财务指标数据
+            # 鍚堝苟璐㈠姟鎸囨爣鏁版嵁
             factor_df = factor_df.join(fina_df[
                 ['roe', 'roa', 'roa2_yearly', 'profit_to_gr',
                  'q_profit_yoy', 'q_eps', 'assets_turn']
             ], how='left')
 
-            # 检查是否成功匹配到任何数据
+            # 妫€鏌ユ槸鍚︽垚鍔熷尮閰嶅埌浠讳綍鏁版嵁
             roe_col = 'roe' if 'roe' in factor_df.columns else None
             if roe_col and factor_df[roe_col].notna().any():
-                logger.info(f"  ✅ 成功匹配到 {factor_df[roe_col].notna().sum()} 条财务指标记录")
+                logger.info(f"  鉁?鎴愬姛鍖归厤鍒?{factor_df[roe_col].notna().sum()} 鏉¤储鍔℃寚鏍囪褰?)
             elif roe_col:
-                logger.warning(f"  ⚠️  join未匹配到任何财务指标数据，尝试使用merge方式...")
+                logger.warning(f"  鈿狅笍  join鏈尮閰嶅埌浠讳綍璐㈠姟鎸囨爣鏁版嵁锛屽皾璇曚娇鐢╩erge鏂瑰紡...")
 
-                # 备用方案：使用merge而不是join
+                # 澶囩敤鏂规锛氫娇鐢╩erge鑰屼笉鏄痡oin
                 fina_for_merge = fina_df.reset_index()
                 fina_for_merge.rename(columns={'datetime': 'datetime_fina'}, inplace=True)
 
@@ -1004,14 +922,12 @@ class DataPipeline:
                 factor_reset['datetime'] = pd.to_datetime(factor_reset['datetime']).dt.date
                 fina_for_merge['datetime_fina'] = pd.to_datetime(fina_for_merge['datetime_fina']).dt.date
 
-                # 使用merge，允许"小于等于"匹配
+                # 浣跨敤merge锛屽厑璁?灏忎簬绛変簬"鍖归厤
                 merged_data = []
                 for idx, row in factor_reset.iterrows():
-                    # 找到最近的财务报告日期（<= 当前日期）
-                    matching_fina = fina_for_merge[fina_for_merge['datetime_fina'] <= row['datetime']]
+                    # 鎵惧埌鏈€杩戠殑璐㈠姟鎶ュ憡鏃ユ湡锛?= 褰撳墠鏃ユ湡锛?                    matching_fina = fina_for_merge[fina_for_merge['datetime_fina'] <= row['datetime']]
                     if not matching_fina.empty:
-                        # 取最近的一条
-                        latest_fina = matching_fina.iloc[-1]
+                        # 鍙栨渶杩戠殑涓€鏉?                        latest_fina = matching_fina.iloc[-1]
                         for col in ['roe', 'roa', 'roa2_yearly', 'profit_to_gr',
                                     'q_profit_yoy', 'q_eps', 'assets_turn']:
                             if col in latest_fina.index:
@@ -1022,102 +938,95 @@ class DataPipeline:
                 factor_df.set_index(['instrument', 'datetime'], inplace=True)
 
                 if 'roe' in factor_df.columns and factor_df['roe'].notna().any():
-                    logger.info(f"  ✅ merge方式成功！匹配到 {factor_df['roe'].notna().sum()} 条记录")
+                    logger.info(f"  鉁?merge鏂瑰紡鎴愬姛锛佸尮閰嶅埌 {factor_df['roe'].notna().sum()} 鏉¤褰?)
             else:
-                logger.warning("  ⚠️  无ROE字段")
+                logger.warning("  鈿狅笍  鏃燫OE瀛楁")
 
-            # 前向填充(ffill)将季度数据填充到每个交易日
-            if len(factor_df) > 0:
+            # 鍓嶅悜濉厖(ffill)灏嗗搴︽暟鎹～鍏呭埌姣忎釜浜ゆ槗鏃?            if len(factor_df) > 0:
                 factor_df = factor_df.sort_index()
                 fina_cols = ['roe', 'roa', 'roa2_yearly', 'profit_to_gr',
                              'q_profit_yoy', 'q_eps', 'assets_turn']
                 existing_cols = [col for col in fina_cols if col in factor_df.columns]
                 if existing_cols:
-                    # 统计填充前的非空数量
+                    # 缁熻濉厖鍓嶇殑闈炵┖鏁伴噺
                     before_fill = {col: factor_df[col].notna().sum() for col in existing_cols}
 
-                    # 执行前向填充
+                    # 鎵ц鍓嶅悜濉厖
                     factor_df[existing_cols] = factor_df[existing_cols].ffill()
 
-                    # 统计填充后的非空数量
+                    # 缁熻濉厖鍚庣殑闈炵┖鏁伴噺
                     after_fill = {col: factor_df[col].notna().sum() for col in existing_cols}
 
-                    # 记录日志
-                    fill_info = ', '.join([f"{col}:{before_fill[col]}→{after_fill[col]}" for col in existing_cols])
-                    logger.info(f"  ✅ 财务指标前向填充完成 ({fill_info})")
+                    # 璁板綍鏃ュ織
+                    fill_info = ', '.join([f"{col}:{before_fill[col]}鈫抺after_fill[col]}" for col in existing_cols])
+                    logger.info(f"  鉁?璐㈠姟鎸囨爣鍓嶅悜濉厖瀹屾垚 ({fill_info})")
         else:
-            logger.info("  ⚠️  无财务指标数据（接口可能返回空或积分不足）")
+            logger.info("  鈿狅笍  鏃犺储鍔℃寚鏍囨暟鎹紙鎺ュ彛鍙兘杩斿洖绌烘垨绉垎涓嶈冻锛?)
 
-        # 添加股票代码作为instrument索引
+        # 娣诲姞鑲＄エ浠ｇ爜浣滀负instrument绱㈠紩
         factor_df['instrument'] = ts_code
         factor_df.reset_index(inplace=True)
         factor_df.set_index(['instrument', 'datetime'], inplace=True)
 
-        logger.info(f"  {ts_code} 数据获取完成，共 {len(factor_df)} 条记录")
+        logger.info(f"  {ts_code} 鏁版嵁鑾峰彇瀹屾垚锛屽叡 {len(factor_df)} 鏉¤褰?)
         return factor_df
 
     def save_stock_to_csv(self, ts_code: str, df: pd.DataFrame) -> bool:
         """
-        将单只股票数据保存为CSV文件
+        灏嗗崟鍙偂绁ㄦ暟鎹繚瀛樹负CSV鏂囦欢
 
-        参数：
-            ts_code: 股票代码 (如 '000001.SZ')
-            df: 股票数据DataFrame
+        鍙傛暟锛?            ts_code: 鑲＄エ浠ｇ爜 (濡?'000001.SZ')
+            df: 鑲＄エ鏁版嵁DataFrame
 
-        返回：
-            是否保存成功
+        杩斿洖锛?            鏄惁淇濆瓨鎴愬姛
         """
         if df.empty:
             return False
 
         try:
-            # 与 qlib dump_bin 一致：文件名 stem 即为证券代码，如 000001.sz -> 000001.SZ
+            # 涓?qlib dump_bin 涓€鑷达細鏂囦欢鍚?stem 鍗充负璇佸埜浠ｇ爜锛屽 000001.sz -> 000001.SZ
             csv_filename = f"{ts_code.lower()}.csv"
             csv_path = self.csv_dir / csv_filename
 
-            # 重置索引，将instrument和 datetime变为普通列
+            # 閲嶇疆绱㈠紩锛屽皢instrument鍜?datetime鍙樹负鏅€氬垪
             df_to_save = df.reset_index()
             add_qlib_standard_ohlcv_columns(df_to_save)
 
-            # 保存为CSV
+            # 淇濆瓨涓篊SV
             df_to_save.to_csv(csv_path, index=False, encoding='utf-8-sig')
 
-            logger.info(f"  💾 已保存: {csv_path.name} ({len(df)} 条记录)")
+            logger.info(f"  馃捑 宸蹭繚瀛? {csv_path.name} ({len(df)} 鏉¤褰?")
             return True
 
         except Exception as e:
-            logger.error(f"保存 {ts_code} CSV失败: {e}")
+            logger.error(f"淇濆瓨 {ts_code} CSV澶辫触: {e}")
             return False
 
     def download_all_to_csv(self, stock_codes: List[str] = None) -> Tuple[int, int]:
         """
-        阶段1：下载所有股票数据并保存为CSV文件
+        闃舵1锛氫笅杞芥墍鏈夎偂绁ㄦ暟鎹苟淇濆瓨涓篊SV鏂囦欢
 
-        参数：
-            stock_codes: 要处理的股票代码列表（None表示处理全部）
-
-        返回：
-            (成功数量, 失败数量)
+        鍙傛暟锛?            stock_codes: 瑕佸鐞嗙殑鑲＄エ浠ｇ爜鍒楄〃锛圢one琛ㄧず澶勭悊鍏ㄩ儴锛?
+        杩斿洖锛?            (鎴愬姛鏁伴噺, 澶辫触鏁伴噺)
         """
         logger.info("\n" + "="*80)
-        logger.info("【阶段1/2】开始下载数据到CSV文件")
+        logger.info("銆愰樁娈?/2銆戝紑濮嬩笅杞芥暟鎹埌CSV鏂囦欢")
         logger.info("="*80)
-        logger.info(f"时间范围: {self.start_date} ~ {self.end_date}")
-        logger.info(f"CSV目录: {self.csv_dir}")
-        logger.info(f"频率限制模式: {'高速(8000+积分)' if self.rate_limiter.high_speed else '标准(5000积分)'}")
+        logger.info(f"鏃堕棿鑼冨洿: {self.start_date} ~ {self.end_date}")
+        logger.info(f"CSV鐩綍: {self.csv_dir}")
+        logger.info(f"棰戠巼闄愬埗妯″紡: {'楂橀€?8000+绉垎)' if self.rate_limiter.high_speed else '鏍囧噯(5000绉垎)'}")
 
-        # 获取股票列表
+        # 鑾峰彇鑲＄エ鍒楄〃
         stock_list = self.fetcher.get_stock_list()
 
         if stock_codes is None:
             stock_codes = stock_list['ts_code'].tolist()
 
-        # 限制处理的股票数量（用于测试）
-        if self.max_stocks:
+        # 闄愬埗澶勭悊鐨勮偂绁ㄦ暟閲忥紙鐢ㄤ簬娴嬭瘯锛?        if self.max_stocks:
             stock_codes = stock_codes[:self.max_stocks]
-            logger.info(f"测试模式：仅处理前 {self.max_stocks} 只股票")
+            logger.info(f"娴嬭瘯妯″紡锛氫粎澶勭悊鍓?{self.max_stocks} 鍙偂绁?)
 
-        logger.info(f"待处理股票数量: {len(stock_codes)}")
+        logger.info(f"寰呭鐞嗚偂绁ㄦ暟閲? {len(stock_codes)}")
 
         success_count = 0
         fail_count = 0
@@ -1125,10 +1034,10 @@ class DataPipeline:
         total = len(stock_codes)
 
         workers = min(self.download_workers, total) if total > 0 else 1
-        logger.info(f"下载执行模式: {'串行' if workers == 1 else f'并发({workers}线程)'}")
+        logger.info(f"涓嬭浇鎵ц妯″紡: {'涓茶' if workers == 1 else f'骞跺彂({workers}绾跨▼)'}")
 
         if workers == 1:
-            pbar = tqdm(stock_codes, total=total, desc="下载CSV", unit="stock")
+            pbar = tqdm(stock_codes, total=total, desc="涓嬭浇CSV", unit="stock")
             for i, ts_code in enumerate(pbar, 1):
                 status = self._download_single_stock(ts_code)
                 if status == "success":
@@ -1147,7 +1056,7 @@ class DataPipeline:
                 )
                 if i % 50 == 0:
                     self._print_rate_stats()
-                    logger.info(f"\n📊 当前进度: 成功={success_count}, 失败={fail_count}, 跳过={skipped_count}")
+                    logger.info(f"\n馃搳 褰撳墠杩涘害: 鎴愬姛={success_count}, 澶辫触={fail_count}, 璺宠繃={skipped_count}")
             pbar.close()
         else:
             futures = {}
@@ -1155,7 +1064,7 @@ class DataPipeline:
                 for ts_code in stock_codes:
                     futures[executor.submit(self._download_single_stock, ts_code)] = ts_code
 
-                pbar = tqdm(total=total, desc="下载CSV", unit="stock")
+                pbar = tqdm(total=total, desc="涓嬭浇CSV", unit="stock")
                 for i, future in enumerate(as_completed(futures), 1):
                     status = future.result()
                     if status == "success":
@@ -1175,37 +1084,35 @@ class DataPipeline:
                     )
                     if i % 50 == 0:
                         self._print_rate_stats()
-                        logger.info(f"\n📊 当前进度: 成功={success_count}, 失败={fail_count}, 跳过={skipped_count}")
+                        logger.info(f"\n馃搳 褰撳墠杩涘害: 鎴愬姛={success_count}, 澶辫触={fail_count}, 璺宠繃={skipped_count}")
                 pbar.close()
 
         logger.info(f"\n{'='*60}")
-        logger.info("【阶段1完成】CSV下载统计:")
-        logger.info(f"  ✅ 成功: {success_count} 只股票")
-        logger.info(f"  ⏭️  跳过(已存在): {skipped_count} 只股票")
-        logger.info(f"  ❌ 失败: {fail_count} 只股票")
-        logger.info(f"  📁 CSV文件保存在: {self.csv_dir}")
+        logger.info("銆愰樁娈?瀹屾垚銆慍SV涓嬭浇缁熻:")
+        logger.info(f"  鉁?鎴愬姛: {success_count} 鍙偂绁?)
+        logger.info(f"  鈴笍  璺宠繃(宸插瓨鍦?: {skipped_count} 鍙偂绁?)
+        logger.info(f"  鉂?澶辫触: {fail_count} 鍙偂绁?)
+        logger.info(f"  馃搧 CSV鏂囦欢淇濆瓨鍦? {self.csv_dir}")
 
         return success_count, fail_count
 
     def convert_csv_to_qlib(self) -> bool:
         """
-        阶段2：使用微软 qlib 官方 scripts/dump_bin.py 中的 DumpDataAll 转为 Qlib 目录结构。
-
-        正确目录布局为 features/<股票代码目录>/<字段>.day.bin（见 qlib LocalFeatureProvider），
-        不可用单文件 features/<字段>.day.bin 混存多只股票。
-        """
+        闃舵2锛氫娇鐢ㄥ井杞?qlib 瀹樻柟 scripts/dump_bin.py 涓殑 DumpDataAll 杞负 Qlib 鐩綍缁撴瀯銆?
+        姝ｇ‘鐩綍甯冨眬涓?features/<鑲＄エ浠ｇ爜鐩綍>/<瀛楁>.day.bin锛堣 qlib LocalFeatureProvider锛夛紝
+        涓嶅彲鐢ㄥ崟鏂囦欢 features/<瀛楁>.day.bin 娣峰瓨澶氬彧鑲＄エ銆?        """
         logger.info("\n" + "="*80)
-        logger.info("【阶段2/2】从CSV转换到Qlib格式（官方 dump_bin.DumpDataAll）")
+        logger.info("銆愰樁娈?/2銆戜粠CSV杞崲鍒癚lib鏍煎紡锛堝畼鏂?dump_bin.DumpDataAll锛?)
         logger.info("="*80)
-        logger.info(f"CSV目录: {self.csv_dir}")
-        logger.info(f"Qlib输出目录: {self.converter.output_dir}")
+        logger.info(f"CSV鐩綍: {self.csv_dir}")
+        logger.info(f"Qlib杈撳嚭鐩綍: {self.converter.output_dir}")
 
         csv_files = sorted(self.csv_dir.glob("*.csv"))
         if not csv_files:
-            logger.error("未找到任何CSV文件！请先执行阶段1（下载）")
+            logger.error("鏈壘鍒颁换浣旵SV鏂囦欢锛佽鍏堟墽琛岄樁娈?锛堜笅杞斤級")
             return False
 
-        logger.info(f"找到 {len(csv_files)} 个CSV文件")
+        logger.info(f"鎵惧埌 {len(csv_files)} 涓狢SV鏂囦欢")
 
         for csv_path in csv_files:
             try:
@@ -1213,7 +1120,7 @@ class DataPipeline:
                 add_qlib_standard_ohlcv_columns(df_patch)
                 df_patch.to_csv(csv_path, index=False, encoding="utf-8-sig")
             except Exception as e:
-                logger.warning("为 %s 写入标准 OHLCV 列失败: %s", csv_path.name, e)
+                logger.warning("涓?%s 鍐欏叆鏍囧噯 OHLCV 鍒楀け璐? %s", csv_path.name, e)
 
         sample = pd.read_csv(csv_files[0], nrows=512, encoding="utf-8-sig")
         skip_cols = {"datetime", "instrument", "trade_date", "ts_code"}
@@ -1223,18 +1130,18 @@ class DataPipeline:
             if c not in skip_cols and pd.api.types.is_numeric_dtype(sample[c])
         ]
         if not feature_cols:
-            logger.error("未能从CSV中识别数值特征列，请检查列名与数据类型")
+            logger.error("鏈兘浠嶤SV涓瘑鍒暟鍊肩壒寰佸垪锛岃妫€鏌ュ垪鍚嶄笌鏁版嵁绫诲瀷")
             return False
 
         include_fields = ",".join(feature_cols)
-        logger.info(f"将 dump 的数值特征列数: {len(feature_cols)}")
+        logger.info(f"灏?dump 鐨勬暟鍊肩壒寰佸垪鏁? {len(feature_cols)}")
 
         qlib_main = Path(os.environ.get("QLIB_SOURCE", r"D:\quant_project\qlib-main"))
         scripts_dir = qlib_main / "scripts"
         dump_script = scripts_dir / "dump_bin.py"
         if not dump_script.is_file():
             logger.error(
-                "未找到 qlib 源码中的 dump_bin.py: %s。请克隆 qlib 或设置环境变量 QLIB_SOURCE 指向 qlib 根目录",
+                "鏈壘鍒?qlib 婧愮爜涓殑 dump_bin.py: %s銆傝鍏嬮殕 qlib 鎴栬缃幆澧冨彉閲?QLIB_SOURCE 鎸囧悜 qlib 鏍圭洰褰?,
                 dump_script,
             )
             return False
@@ -1246,7 +1153,7 @@ class DataPipeline:
             from dump_bin import DumpDataAll
         except ImportError as exc:
             logger.error(
-                "无法导入 dump_bin（需要已安装 qlib: pip install qlib）。详情: %s",
+                "鏃犳硶瀵煎叆 dump_bin锛堥渶瑕佸凡瀹夎 qlib: pip install qlib锛夈€傝鎯? %s",
                 exc,
             )
             return False
@@ -1264,175 +1171,164 @@ class DataPipeline:
             )
             dumper.dump()
         except Exception:
-            logger.exception("dump_bin 转换失败")
+            logger.exception("dump_bin 杞崲澶辫触")
             return False
 
         logger.info("\n" + "="*80)
-        logger.info("【阶段2完成】Qlib格式转换成功（官方布局: calendars/ + instruments/ + features/<代码>/）")
+        logger.info("銆愰樁娈?瀹屾垚銆慟lib鏍煎紡杞崲鎴愬姛锛堝畼鏂瑰竷灞€: calendars/ + instruments/ + features/<浠ｇ爜>/锛?)
         logger.info("="*80)
-        logger.info("📁 Qlib数据目录: %s", self.converter.output_dir)
-        logger.info("初始化示例: qlib.init(provider_uri=r'%s')", out_dir)
+        logger.info("馃搧 Qlib鏁版嵁鐩綍: %s", self.converter.output_dir)
+        logger.info("鍒濆鍖栫ず渚? qlib.init(provider_uri=r'%s')", out_dir)
 
         return True
 
     def run(self, stock_codes: List[str] = None):
         """
-        运行完整的数据管道（两阶段）
+        杩愯瀹屾暣鐨勬暟鎹閬擄紙涓ら樁娈碉級
 
-        参数：
-            stock_codes: 要处理的股票代码列表（None表示处理全部）
-        """
+        鍙傛暟锛?            stock_codes: 瑕佸鐞嗙殑鑲＄エ浠ｇ爜鍒楄〃锛圢one琛ㄧず澶勭悊鍏ㄩ儴锛?        """
         logger.info("\n" + "="*80)
-        logger.info("开始执行完整数据管道（两阶段）")
+        logger.info("寮€濮嬫墽琛屽畬鏁存暟鎹閬擄紙涓ら樁娈碉級")
         logger.info("="*80)
 
-        # 阶段1：下载到CSV
+        # 闃舵1锛氫笅杞藉埌CSV
         success, fail = self.download_all_to_csv(stock_codes)
 
         if success == 0 and fail == 0:
-            logger.error("没有获取到任何数据！")
+            logger.error("娌℃湁鑾峰彇鍒颁换浣曟暟鎹紒")
             return
 
-        # 阶段2：转换为Qlib格式
+        # 闃舵2锛氳浆鎹负Qlib鏍煎紡
         if success > 0:
             self.convert_csv_to_qlib()
         else:
-            logger.warning("没有成功的下载，跳过Qlib转换阶段")
+            logger.warning("娌℃湁鎴愬姛鐨勪笅杞斤紝璺宠繃Qlib杞崲闃舵")
 
-        # 打印最终统计
-        self._print_final_stats(success, fail, None)
+        # 鎵撳嵃鏈€缁堢粺璁?        self._print_final_stats(success, fail, None)
 
     def _print_rate_stats(self):
-        """打印API调用统计信息"""
+        """鎵撳嵃API璋冪敤缁熻淇℃伅"""
         stats = self.rate_limiter.get_stats()
-        logger.info("\n📊 API调用统计（最近1分钟）:")
+        logger.info("\n馃搳 API璋冪敤缁熻锛堟渶杩?鍒嗛挓锛?")
         for api_name, info in stats.items():
             logger.info(
                 f"   {api_name:20s}: "
-                f"{info['recent_requests']:3d}次 / "
-                f"{info['rate_limit']:5.1f}次/分钟 "
-                f"(利用率: {info['utilization']:5.1f}%)"
+                f"{info['recent_requests']:3d}娆?/ "
+                f"{info['rate_limit']:5.1f}娆?鍒嗛挓 "
+                f"(鍒╃敤鐜? {info['utilization']:5.1f}%)"
             )
 
     def _print_final_stats(self, success_count: int, fail_count: int, merged_df: Optional[pd.DataFrame]):
-        """打印最终统计信息"""
-        print("\n📊 数据统计:")
-        print(f"  ✅ 成功处理股票: {success_count}")
-        print(f"  ❌ 失败股票: {fail_count}")
+        """鎵撳嵃鏈€缁堢粺璁′俊鎭?""
+        print("\n馃搳 鏁版嵁缁熻:")
+        print(f"  鉁?鎴愬姛澶勭悊鑲＄エ: {success_count}")
+        print(f"  鉂?澶辫触鑲＄エ: {fail_count}")
         if merged_df is not None:
-            print(f"  📈 总记录数: {len(merged_df)}")
-            print(f"  🗂️  包含字段: {len(merged_df.columns)} 个")
+            print(f"  馃搱 鎬昏褰曟暟: {len(merged_df)}")
+            print(f"  馃梻锔? 鍖呭惈瀛楁: {len(merged_df.columns)} 涓?)
         else:
-            print("  📈 总记录数: (阶段2 已用 dump_bin，未保留合并 DataFrame)")
-        print(f"  📁 输出目录: {self.converter.output_dir}")
+            print("  馃搱 鎬昏褰曟暟: (闃舵2 宸茬敤 dump_bin锛屾湭淇濈暀鍚堝苟 DataFrame)")
+        print(f"  馃搧 杈撳嚭鐩綍: {self.converter.output_dir}")
 
-        # 打印API调用统计
+        # 鎵撳嵃API璋冪敤缁熻
         stats = self.rate_limiter.get_stats()
-        print(f"\n⏱️  API频率使用情况:")
+        print(f"\n鈴憋笍  API棰戠巼浣跨敤鎯呭喌:")
         for api_name, info in stats.items():
-            print(f"  {api_name}: {info['recent_requests']} 次/分钟 (限制: {info['rate_limit']:.0f}次/分钟)")
+            print(f"  {api_name}: {info['recent_requests']} 娆?鍒嗛挓 (闄愬埗: {info['rate_limit']:.0f}娆?鍒嗛挓)")
 
 
 def main():
-    """主函数"""
+    """涓诲嚱鏁?""
     parser = argparse.ArgumentParser(
-        description='从Tushare获取金融数据并转换为Qlib格式',
+        description='浠嶵ushare鑾峰彇閲戣瀺鏁版嵁骞惰浆鎹负Qlib鏍煎紡',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-环境变量支持：
-  TUSHARE_API_KEY  - Tushare API Token（优先级最高）
-  TUSHARE_TOKEN    - 兼容旧版环境变量名
-
-示例用法：
-  # 使用环境变量Token
+鐜鍙橀噺鏀寔锛?  TUSHARE_API_KEY  - Tushare API Token锛堜紭鍏堢骇鏈€楂橈級
+  TUSHARE_TOKEN    - 鍏煎鏃х増鐜鍙橀噺鍚?
+绀轰緥鐢ㄦ硶锛?  # 浣跨敤鐜鍙橀噺Token
   set TUSHARE_API_KEY=your_token
   python tushare_to_qlib.py --start_date 20200101 --end_date 20231231
 
-  # 使用命令行参数Token
+  # 浣跨敤鍛戒护琛屽弬鏁癟oken
   python tushare_to_qlib.py --token YOUR_TOKEN --start_date 20200101 --end_date 20231231
 
-  # 测试模式（只处理10只股票）
+  # 娴嬭瘯妯″紡锛堝彧澶勭悊10鍙偂绁級
   python tushare_to_qlib.py --start_date 20230101 --end_date 20231231 --max_stocks 10
 
-  # 高速模式（需要8000+积分）
-  python tushare_to_qlib.py --start_date 20230101 --end_date 20231231 --high-speed
+  # 楂橀€熸ā寮忥紙闇€瑕?000+绉垎锛?  python tushare_to_qlib.py --start_date 20230101 --end_date 20231231 --high-speed
 
-  # 自定义输出目录
-  python tushare_to_qlib.py --token YOUR_TOKEN --output_dir D:/my_qlib_data
+  # 鑷畾涔夎緭鍑虹洰褰?  python tushare_to_qlib.py --token YOUR_TOKEN --output_dir D:/my_qlib_data
 
-频率限制说明：
-  标准模式 (默认): 适合5000积分用户
-    - stk_factor_pro: 30次/分钟
-    - 其他接口: 20-30次/分钟
+棰戠巼闄愬埗璇存槑锛?  鏍囧噯妯″紡 (榛樿): 閫傚悎5000绉垎鐢ㄦ埛
+    - stk_factor_pro: 30娆?鍒嗛挓
+    - 鍏朵粬鎺ュ彛: 20-30娆?鍒嗛挓
 
-  高速模式 (--high-speed): 需要8000+积分
-    - stk_factor_pro: 500次/分钟
-    - 其他接口: 40-120次/分钟
+  楂橀€熸ā寮?(--high-speed): 闇€瑕?000+绉垎
+    - stk_factor_pro: 500娆?鍒嗛挓
+    - 鍏朵粬鎺ュ彛: 40-120娆?鍒嗛挓
         """
     )
 
     parser.add_argument('--token', type=str, default=None,
-                        help='Tushare Pro API Token（可选，也可使用环境变量 TUSHARE_API_KEY）')
+                        help='Tushare Pro API Token锛堝彲閫夛紝涔熷彲浣跨敤鐜鍙橀噺 TUSHARE_API_KEY锛?)
     parser.add_argument('--start_date', type=str, default='20200101',
-                        help='开始日期 (YYYYMMDD)，默认: 20200101')
+                        help='寮€濮嬫棩鏈?(YYYYMMDD)锛岄粯璁? 20200101')
     parser.add_argument('--end_date', type=str, default='20231231',
-                        help='结束日期 (YYYYMMDD)，默认: 20231231')
+                        help='缁撴潫鏃ユ湡 (YYYYMMDD)锛岄粯璁? 20231231')
     parser.add_argument('--output_dir', type=str,
                         default=r'D:\qlib_data\qlib_data',
-                        help=f'Qlib数据输出目录，默认: D:\\qlib_data\\qlib_data')
+                        help=f'Qlib鏁版嵁杈撳嚭鐩綍锛岄粯璁? D:\\qlib_data\\qlib_data')
     parser.add_argument('--csv_dir', type=str, default=r'D:\qlib_data\csv_data',
-                        help='CSV文件保存目录（默认: D:\\qlib_data\\csv_data）')
+                        help='CSV鏂囦欢淇濆瓨鐩綍锛堥粯璁? D:\\qlib_data\\csv_data锛?)
     parser.add_argument('--max_stocks', type=int, default=None,
-                        help='最大处理股票数量（用于测试），默认: 全部')
+                        help='鏈€澶у鐞嗚偂绁ㄦ暟閲忥紙鐢ㄤ簬娴嬭瘯锛夛紝榛樿: 鍏ㄩ儴')
     parser.add_argument('--high-speed', action='store_true',
-                        help='启用高速模式（需要8000+积分，大幅提高请求速率）')
+                        help='鍚敤楂橀€熸ā寮忥紙闇€瑕?000+绉垎锛屽ぇ骞呮彁楂樿姹傞€熺巼锛?)
     parser.add_argument('--download_workers', type=int, default=4,
-                        help='下载阶段并发线程数，默认: 4（建议 2-8）')
+                        help='涓嬭浇闃舵骞跺彂绾跨▼鏁帮紝榛樿: 4锛堝缓璁?2-8锛?)
     parser.add_argument('--stage', type=str, default='all',
                         choices=['all', 'download', 'convert'],
-                        help='执行阶段: all(完整流程)/download(仅下载CSV)/convert(仅转Qlib)，默认: all')
+                        help='鎵ц闃舵: all(瀹屾暣娴佺▼)/download(浠呬笅杞紺SV)/convert(浠呰浆Qlib)锛岄粯璁? all')
 
     args = parser.parse_args()
 
-    # 获取Token（优先级：命令行参数 > 环境变量 > 配置文件）
-    token = args.token
+    # 鑾峰彇Token锛堜紭鍏堢骇锛氬懡浠よ鍙傛暟 > 鐜鍙橀噺 > 閰嶇疆鏂囦欢锛?    token = args.token
 
     if not token:
-        # 尝试从环境变量获取
-        token = os.environ.get('TUSHARE_API_KEY', '').strip()
+        # 灏濊瘯浠庣幆澧冨彉閲忚幏鍙?        token = os.environ.get('TUSHARE_API_KEY', '').strip()
         if token:
-            logger.info(f"✅ 从环境变量 TUSHARE_API_KEY 获取到Token")
+            logger.info(f"鉁?浠庣幆澧冨彉閲?TUSHARE_API_KEY 鑾峰彇鍒癟oken")
 
     if not token:
-        # 尝试备用环境变量
+        # 灏濊瘯澶囩敤鐜鍙橀噺
         token = os.environ.get('TUSHARE_TOKEN', '').strip()
         if token:
-            logger.info("⚠️  从环境变量 TUSHARE_TOKEN 获取到Token（建议使用 TUSHARE_API_KEY）")
+            logger.info("鈿狅笍  浠庣幆澧冨彉閲?TUSHARE_TOKEN 鑾峰彇鍒癟oken锛堝缓璁娇鐢?TUSHARE_API_KEY锛?)
 
     if not token:
-        # 尝试配置文件
+        # 灏濊瘯閰嶇疆鏂囦欢
         token = get_tushare_token()
 
     if not token:
-        print("\n❌ 错误：未提供Tushare API Token！")
-        print("\n请通过以下任一方式提供Token：")
-        print("  1. 命令行参数: --token YOUR_TOKEN")
-        print("  2. 环境变量: set TUSHARE_API_KEY=YOUR_TOKEN")
-        print("  3. 配置文件: config/secrets.yaml")
-        print("\n示例:")
+        print("\n鉂?閿欒锛氭湭鎻愪緵Tushare API Token锛?)
+        print("\n璇烽€氳繃浠ヤ笅浠讳竴鏂瑰紡鎻愪緵Token锛?)
+        print("  1. 鍛戒护琛屽弬鏁? --token YOUR_TOKEN")
+        print("  2. 鐜鍙橀噺: set TUSHARE_API_KEY=YOUR_TOKEN")
+        print("  3. 閰嶇疆鏂囦欢: config/secrets.yaml")
+        print("\n绀轰緥:")
         print("  set TUSHARE_API_KEY=your_token_here")
         print("  python tushare_to_qlib.py --start_date 20230101 --end_date 20231231\n")
         sys.exit(1)
 
-    # 验证日期格式
+    # 楠岃瘉鏃ユ湡鏍煎紡
     try:
         pd.to_datetime(args.start_date)
         pd.to_datetime(args.end_date)
     except ValueError:
-        logger.error("日期格式错误，请使用 YYYYMMDD 格式")
+        logger.error("鏃ユ湡鏍煎紡閿欒锛岃浣跨敤 YYYYMMDD 鏍煎紡")
         sys.exit(1)
 
-    # 创建管道
+    # 鍒涘缓绠￠亾
     pipeline = DataPipeline(
         token=token,
         output_dir=args.output_dir,
@@ -1444,17 +1340,17 @@ def main():
         download_workers=args.download_workers
     )
 
-    # 根据stage参数执行不同操作
+    # 鏍规嵁stage鍙傛暟鎵ц涓嶅悓鎿嶄綔
     if args.stage == 'all':
-        # 完整流程：下载 + 转换
+        # 瀹屾暣娴佺▼锛氫笅杞?+ 杞崲
         pipeline.run()
     elif args.stage == 'download':
-        # 仅下载到CSV
+        # 浠呬笅杞藉埌CSV
         success, fail = pipeline.download_all_to_csv()
-        print(f"\n📊 下载完成！成功: {success}, 失败: {fail}")
-        print(f"📁 CSV目录: {pipeline.csv_dir}")
+        print(f"\n馃搳 涓嬭浇瀹屾垚锛佹垚鍔? {success}, 澶辫触: {fail}")
+        print(f"馃搧 CSV鐩綍: {pipeline.csv_dir}")
     elif args.stage == 'convert':
-        # 仅从CSV转换为Qlib
+        # 浠呬粠CSV杞崲涓篞lib
         success = pipeline.convert_csv_to_qlib()
         if not success:
             sys.exit(1)
@@ -1462,3 +1358,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
