@@ -7,7 +7,7 @@
 
 用法：
     python index_weight_to_instruments.py
-    python index_weight_to_instruments.py --start_date 20260301 --end_date 20260331
+    python index_weight_to_instruments.py --start_date 20200101 --end_date 20260430
     python index_weight_to_instruments.py --output_dir D:/qlib_data/qlib_data/instruments
 """
 
@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from tushare_to_qlib import get_tushare_token
+from tushare_to_qlib_async import get_tushare_token
 
 logging.basicConfig(
     level=logging.INFO,
