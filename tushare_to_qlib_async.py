@@ -9,7 +9,7 @@ Features:
 3. Save to specified directory
 
 Usage:
-    python tushare_to_qlib_async.py --start_date 20200101 --end_date 20260428
+    python tushare_to_qlib_async.py --start_date 20200101 --end_date 20260511
     Or set TUSHARE_API_KEY environment variable before running
 """
 
@@ -254,6 +254,97 @@ class AsyncTushareDataFetcher:
     async def get_fina_indicator(self, ts_code: str, start_date: str, end_date: str, fields: List[str]) -> pd.DataFrame:
         return await self._fetch_api('fina_indicator', ts_code, start_date, end_date, fields, 'fina_ind')
 
+    async def get_trade_dates(self, start_date: str, end_date: str) -> List[str]:
+        """Fetch trading-day list (YYYYMMDD) within [start_date, end_date]."""
+        cache_name = f"trade_cal_{start_date}_{end_date}.parquet"
+        cached = self._load_cache(cache_name)
+        if cached is not None and len(cached) > 0 and 'cal_date' in cached.columns:
+            return sorted(cached['cal_date'].astype(str).tolist())
+
+        def _fetch():
+            return self.pro.trade_cal(exchange='', start_date=start_date, end_date=end_date, is_open='1')
+
+        try:
+            if self.rate_limiter:
+                df = await self.rate_limiter.execute_with_rate_limit('stock_basic', _fetch)
+            else:
+                df = await asyncio.to_thread(_fetch)
+            if df is None or len(df) == 0:
+                return []
+            if not isinstance(df, pd.DataFrame):
+                df = pd.DataFrame(df)
+            self._save_cache(cache_name, df)
+            return sorted(df['cal_date'].astype(str).tolist())
+        except Exception as e:
+            logger.warning(f"Failed to fetch trade_cal {start_date}-{end_date}: {e}")
+            return []
+
+    async def _fetch_api_by_date(self, api_name: str, trade_date: str, fields: List[str], cache_prefix: str) -> pd.DataFrame:
+        """Fetch a single trade_date for ALL listed stocks via Tushare batch-by-date interface."""
+        cache_name = f"{cache_prefix}_by_date_{trade_date}.parquet"
+        cached = self._load_cache(cache_name)
+        if cached is not None and len(cached) > 0:
+            return cached
+
+        field_str = ','.join(fields)
+        api_func = getattr(self.pro, api_name)
+
+        def _fetch():
+            return api_func(trade_date=trade_date, fields=field_str)
+
+        try:
+            if self.rate_limiter:
+                df = await self.rate_limiter.execute_with_rate_limit(api_name, _fetch)
+            else:
+                df = await asyncio.to_thread(_fetch)
+            if df is None:
+                return pd.DataFrame()
+            if not isinstance(df, pd.DataFrame):
+                df = pd.DataFrame(df)
+            if len(df) > 0:
+                self._save_cache(cache_name, df)
+            return df
+        except Exception as e:
+            logger.warning(f"Failed to fetch {api_name} by_date {trade_date}: {e}")
+            return pd.DataFrame()
+
+    async def get_stk_factor_pro_by_date(self, trade_date: str, fields: List[str]) -> pd.DataFrame:
+        return await self._fetch_api_by_date('stk_factor_pro', trade_date, fields, 'stk_factor')
+
+    async def get_moneyflow_dc_by_date(self, trade_date: str, fields: List[str]) -> pd.DataFrame:
+        return await self._fetch_api_by_date('moneyflow_dc', trade_date, fields, 'moneyflow')
+
+    async def get_margin_detail_by_date(self, trade_date: str, fields: List[str]) -> pd.DataFrame:
+        return await self._fetch_api_by_date('margin_detail', trade_date, fields, 'margin')
+
+    async def get_fina_indicator_by_period(self, period: str, fields: List[str]) -> pd.DataFrame:
+        """Fetch financial indicators for ALL listed stocks at a single reporting period (YYYYMMDD)."""
+        cache_name = f"fina_ind_by_period_{period}.parquet"
+        cached = self._load_cache(cache_name)
+        if cached is not None and len(cached) > 0:
+            return cached
+
+        field_str = ','.join(fields)
+
+        def _fetch():
+            return self.pro.fina_indicator(period=period, fields=field_str)
+
+        try:
+            if self.rate_limiter:
+                df = await self.rate_limiter.execute_with_rate_limit('fina_indicator', _fetch)
+            else:
+                df = await asyncio.to_thread(_fetch)
+            if df is None:
+                return pd.DataFrame()
+            if not isinstance(df, pd.DataFrame):
+                df = pd.DataFrame(df)
+            if len(df) > 0:
+                self._save_cache(cache_name, df)
+            return df
+        except Exception as e:
+            logger.warning(f"Failed to fetch fina_indicator by_period {period}: {e}")
+            return pd.DataFrame()
+
 
 class QlibDataConverter:
     """Qlib format data converter"""
@@ -351,7 +442,7 @@ class AsyncDataPipeline:
     MARGIN_FIELDS = ['trade_date', 'ts_code', 'rzye', 'rqye']
     FINA_INDICATOR_FIELDS = ['ts_code', 'end_date', 'roe', 'roa', 'roa2_yearly', 'profit_to_gr', 'q_profit_yoy', 'q_eps', 'assets_turn']
 
-    def __init__(self, token: str, output_dir: str, start_date: str, end_date: str, max_stocks=None, high_speed=False, csv_dir=None, max_concurrent=10):
+    def __init__(self, token: str, output_dir: str, start_date: str, end_date: str, max_stocks=None, high_speed=False, csv_dir=None, max_concurrent=10, fetch_mode: str = "by_date"):
         self.rate_limiter = AsyncAPIRateLimiter(high_speed=high_speed, max_concurrent=max_concurrent)
         self.fetcher = AsyncTushareDataFetcher(token, rate_limiter=self.rate_limiter)
         self.converter = QlibDataConverter(output_dir)
@@ -359,8 +450,10 @@ class AsyncDataPipeline:
         self.end_date = end_date
         self.max_stocks = max_stocks
         self.max_concurrent = max_concurrent
+        self.fetch_mode = fetch_mode
         self.csv_dir = Path(csv_dir) if csv_dir else Path(r"D:\qlib_data\csv_data")
         self.csv_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"AsyncDataPipeline fetch_mode={self.fetch_mode}, max_concurrent={self.max_concurrent}, high_speed={high_speed}")
 
     async def fetch_all_data_for_stock(self, ts_code: str) -> pd.DataFrame:
         factor_df = await self.fetcher.get_stk_factor_pro(ts_code, self.start_date, self.end_date, self.STK_FACTOR_FIELDS)
@@ -414,6 +507,206 @@ class AsyncDataPipeline:
             logger.error(f"Failed to save {ts_code} to CSV: {e}")
             return False
 
+    def save_stock_to_csv_merge(self, ts_code: str, new_df: pd.DataFrame) -> bool:
+        """Incrementally merge new rows into existing CSV: read old + concat + dedup(datetime) + sort + write."""
+        if new_df is None or new_df.empty:
+            return False
+        try:
+            csv_path = self.csv_dir / f"{ts_code.lower()}.csv"
+            new_to_save = new_df.reset_index() if isinstance(new_df.index, pd.MultiIndex) or new_df.index.name else new_df.copy()
+            add_qlib_standard_ohlcv_columns(new_to_save)
+            if 'datetime' in new_to_save.columns:
+                new_to_save['datetime'] = pd.to_datetime(new_to_save['datetime'])
+
+            if csv_path.exists():
+                try:
+                    old_df = pd.read_csv(csv_path, encoding='utf-8-sig')
+                    if 'datetime' in old_df.columns:
+                        old_df['datetime'] = pd.to_datetime(old_df['datetime'])
+                    combined = pd.concat([old_df, new_to_save], ignore_index=True, sort=False)
+                    if 'datetime' in combined.columns:
+                        combined = combined.drop_duplicates(subset=['datetime'], keep='last')
+                        combined = combined.sort_values('datetime')
+                    combined.to_csv(csv_path, index=False, encoding='utf-8-sig')
+                except Exception as merge_err:
+                    logger.warning(f"Merge failed for {ts_code}, overwriting: {merge_err}")
+                    new_to_save.to_csv(csv_path, index=False, encoding='utf-8-sig')
+            else:
+                new_to_save.to_csv(csv_path, index=False, encoding='utf-8-sig')
+            return True
+        except Exception as e:
+            logger.error(f"Failed to merge-save {ts_code}: {e}")
+            return False
+
+    def _compute_quarter_periods(self) -> List[str]:
+        """Return quarter-end YYYYMMDD strings covering [start_date, end_date], plus one quarter before start
+        so that the active financial period at start_date is always included."""
+        start = pd.to_datetime(self.start_date, format='%Y%m%d')
+        end = pd.to_datetime(self.end_date, format='%Y%m%d')
+        cur_q = (start.month - 1) // 3 + 1
+        cur_year = start.year
+        cur_q -= 1
+        if cur_q == 0:
+            cur_q = 4
+            cur_year -= 1
+        periods: List[str] = []
+        while True:
+            q_end_month = cur_q * 3
+            q_end_ts = (pd.Timestamp(year=cur_year, month=q_end_month, day=1) + pd.offsets.MonthEnd(0))
+            if q_end_ts > end + pd.Timedelta(days=120):
+                break
+            periods.append(q_end_ts.strftime('%Y%m%d'))
+            cur_q += 1
+            if cur_q > 4:
+                cur_q = 1
+                cur_year += 1
+            if cur_year > end.year + 1:
+                break
+        return periods
+
+    async def download_all_to_csv_by_date(self, stock_codes: List[str] = None) -> Tuple[int, int]:
+        """Batch-by-date pipeline: 4 APIs fetched in parallel across trade dates / periods,
+        then per-stock joined in memory and merged into existing CSVs. Dramatically faster
+        for incremental updates (N days x M stocks -> N+P calls)."""
+        t0 = time.time()
+        stock_list = await self.fetcher.get_stock_list()
+        if stock_codes is None:
+            stock_codes = stock_list['ts_code'].tolist()
+        if self.max_stocks:
+            stock_codes = stock_codes[: self.max_stocks]
+        pool_set = set(stock_codes)
+        logger.info(f"[by_date] pool size: {len(pool_set)} stocks")
+
+        trade_dates = await self.fetcher.get_trade_dates(self.start_date, self.end_date)
+        if not trade_dates:
+            logger.error("[by_date] no trade dates in range, abort")
+            return 0, 0
+        logger.info(f"[by_date] trade dates: {len(trade_dates)} ({trade_dates[0]} ~ {trade_dates[-1]})")
+
+        periods = self._compute_quarter_periods()
+        logger.info(f"[by_date] fina periods: {len(periods)} -> {periods}")
+
+        factor_fields = [f for f in AsyncDataPipeline.STK_FACTOR_FIELDS]
+        money_fields = [f for f in AsyncDataPipeline.MONEYFLOW_FIELDS]
+        margin_fields = [f for f in AsyncDataPipeline.MARGIN_FIELDS]
+        fina_fields = [f for f in AsyncDataPipeline.FINA_INDICATOR_FIELDS]
+
+        async def gather_with_progress(coros, desc):
+            results = []
+            with tqdm(total=len(coros), desc=desc, unit="req") as pbar:
+                for coro in asyncio.as_completed(coros):
+                    res = await coro
+                    results.append(res)
+                    pbar.update(1)
+            return results
+
+        factor_coros = [self.fetcher.get_stk_factor_pro_by_date(d, factor_fields) for d in trade_dates]
+        money_coros = [self.fetcher.get_moneyflow_dc_by_date(d, money_fields) for d in trade_dates]
+        margin_coros = [self.fetcher.get_margin_detail_by_date(d, margin_fields) for d in trade_dates]
+        fina_coros = [self.fetcher.get_fina_indicator_by_period(p, fina_fields) for p in periods]
+
+        factor_results, money_results, margin_results, fina_results = await asyncio.gather(
+            gather_with_progress(factor_coros, "stk_factor_pro by_date"),
+            gather_with_progress(money_coros, "moneyflow_dc by_date"),
+            gather_with_progress(margin_coros, "margin_detail by_date"),
+            gather_with_progress(fina_coros, "fina_indicator by_period"),
+        )
+
+        t1 = time.time()
+        logger.info(f"[by_date] API fetch elapsed: {t1 - t0:.1f}s")
+
+        def _concat_filter(results, label):
+            frames = [df for df in results if isinstance(df, pd.DataFrame) and not df.empty]
+            if not frames:
+                logger.warning(f"[by_date] {label}: no data")
+                return pd.DataFrame()
+            out = pd.concat(frames, ignore_index=True)
+            if 'ts_code' in out.columns:
+                out = out[out['ts_code'].isin(pool_set)].copy()
+            logger.info(f"[by_date] {label}: {len(out)} rows after pool filter")
+            return out
+
+        factor_df = _concat_filter(factor_results, "stk_factor")
+        money_df = _concat_filter(money_results, "moneyflow")
+        margin_df = _concat_filter(margin_results, "margin")
+        fina_df = _concat_filter(fina_results, "fina_indicator")
+
+        if factor_df.empty:
+            logger.error("[by_date] no stk_factor data -> abort")
+            return 0, 0
+
+        factor_df['datetime'] = pd.to_datetime(factor_df['trade_date'])
+        if not money_df.empty:
+            money_df['datetime'] = pd.to_datetime(money_df['trade_date'])
+        if not margin_df.empty:
+            margin_df['datetime'] = pd.to_datetime(margin_df['trade_date'])
+        if not fina_df.empty:
+            fina_df['datetime'] = pd.to_datetime(fina_df['end_date']).dt.normalize()
+            fina_df = fina_df.drop_duplicates(subset=['ts_code', 'datetime'], keep='last')
+
+        factor_groups = factor_df.groupby('ts_code', sort=False)
+        money_groups = money_df.groupby('ts_code', sort=False) if not money_df.empty else None
+        margin_groups = margin_df.groupby('ts_code', sort=False) if not margin_df.empty else None
+        fina_groups = fina_df.groupby('ts_code', sort=False) if not fina_df.empty else None
+
+        money_cols = ['net_amount', 'buy_elg_amount', 'buy_lg_amount', 'buy_md_amount', 'buy_sm_amount']
+        margin_cols = ['rzye', 'rqye']
+        fina_cols = ['roe', 'roa', 'roa2_yearly', 'profit_to_gr', 'q_profit_yoy', 'q_eps', 'assets_turn']
+
+        success = 0
+        fail = 0
+        for ts_code in tqdm(stock_codes, desc="merge & save", unit="stock"):
+            try:
+                if ts_code not in factor_groups.groups:
+                    fail += 1
+                    continue
+                s_factor = factor_groups.get_group(ts_code).copy()
+                s_factor = s_factor.set_index('datetime').sort_index()
+
+                if money_groups is not None and ts_code in money_groups.groups:
+                    m = money_groups.get_group(ts_code).set_index('datetime')
+                    cols = [c for c in money_cols if c in m.columns]
+                    if cols:
+                        s_factor = s_factor.join(m[cols], how='left')
+
+                if margin_groups is not None and ts_code in margin_groups.groups:
+                    m = margin_groups.get_group(ts_code).set_index('datetime')
+                    cols = [c for c in margin_cols if c in m.columns]
+                    if cols:
+                        s_factor = s_factor.join(m[cols], how='left')
+
+                if fina_groups is not None and ts_code in fina_groups.groups:
+                    f = fina_groups.get_group(ts_code).copy()
+                    cols = [c for c in fina_cols if c in f.columns]
+                    if cols:
+                        s_factor.index = s_factor.index.normalize()
+                        f['datetime'] = pd.to_datetime(f['datetime']).dt.normalize()
+                        f = f.drop_duplicates(subset=['datetime'], keep='last').sort_values('datetime')
+                        left = s_factor.reset_index().sort_values('datetime')
+                        merged = pd.merge_asof(
+                            left,
+                            f[['datetime'] + cols],
+                            on='datetime',
+                            direction='backward',
+                        )
+                        s_factor = merged.set_index('datetime')
+                        s_factor[cols] = s_factor[cols].ffill()
+
+                s_factor['instrument'] = ts_code
+                s_factor.reset_index(inplace=True)
+                s_factor.set_index(['instrument', 'datetime'], inplace=True)
+                if self.save_stock_to_csv_merge(ts_code, s_factor):
+                    success += 1
+                else:
+                    fail += 1
+            except Exception as e:
+                logger.error(f"[by_date] error on {ts_code}: {e}")
+                fail += 1
+
+        t2 = time.time()
+        logger.info(f"[by_date] join+save elapsed: {t2 - t1:.1f}s, total: {t2 - t0:.1f}s, success={success}, fail={fail}")
+        return success, fail
+
     async def _download_single_stock(self, ts_code: str) -> str:
         try:
             csv_path = self.csv_dir / f"{ts_code.lower()}.csv"
@@ -459,19 +752,11 @@ class AsyncDataPipeline:
 
         return success_count, fail_count
 
-    def convert_csv_to_qlib(self) -> bool:
+    def convert_csv_to_qlib(self, dump_mode: str = "dump_all") -> bool:
         csv_files = sorted(self.csv_dir.glob("*.csv"))
         if not csv_files:
             logger.error("No CSV files found!")
             return False
-
-        for csv_path in csv_files:
-            try:
-                df_patch = pd.read_csv(csv_path, encoding="utf-8-sig")
-                add_qlib_standard_ohlcv_columns(df_patch)
-                df_patch.to_csv(csv_path, index=False, encoding="utf-8-sig")
-            except Exception as e:
-                logger.warning(f"Failed to add OHLCV columns for {csv_path.name}: {e}")
 
         sample = pd.read_csv(csv_files[0], nrows=512, encoding="utf-8-sig")
         skip_cols = {"datetime", "instrument", "trade_date", "ts_code"}
@@ -489,32 +774,44 @@ class AsyncDataPipeline:
         if str(qlib_main / "scripts") not in sys.path:
             sys.path.insert(0, str(qlib_main / "scripts"))
 
+        max_workers = min(16, (os.cpu_count() or 4))
         try:
-            from dump_bin import DumpDataAll
-        except ImportError as exc:
-            logger.error(f"Failed to import dump_bin: {exc}")
-            return False
-
-        try:
-            dumper = DumpDataAll(
-                data_path=str(self.csv_dir),
-                qlib_dir=str(self.converter.output_dir),
-                date_field_name="datetime",
-                symbol_field_name="instrument",
-                include_fields=",".join(feature_cols),
-                freq="day",
-                max_workers=min(16, (os.cpu_count() or 4)),
-            )
+            if dump_mode == "dump_update":
+                from dump_bin import DumpDataUpdate
+                dumper = DumpDataUpdate(
+                    data_path=str(self.csv_dir),
+                    qlib_dir=str(self.converter.output_dir),
+                    date_field_name="datetime",
+                    symbol_field_name="instrument",
+                    include_fields=",".join(feature_cols),
+                    freq="day",
+                    max_workers=max_workers,
+                )
+            else:
+                from dump_bin import DumpDataAll
+                dumper = DumpDataAll(
+                    data_path=str(self.csv_dir),
+                    qlib_dir=str(self.converter.output_dir),
+                    date_field_name="datetime",
+                    symbol_field_name="instrument",
+                    include_fields=",".join(feature_cols),
+                    freq="day",
+                    max_workers=max_workers,
+                )
             dumper.dump()
             return True
         except Exception:
             logger.exception("dump_bin conversion failed")
             return False
 
-    async def run(self, stock_codes: List[str] = None):
-        success, fail = await self.download_all_to_csv(stock_codes)
+    async def run(self, stock_codes: List[str] = None, dump_mode: str = "dump_all"):
+        if self.fetch_mode == "by_date":
+            success, fail = await self.download_all_to_csv_by_date(stock_codes)
+        else:
+            success, fail = await self.download_all_to_csv(stock_codes)
+        logger.info(f"Download stage done: success={success}, fail={fail}")
         if success > 0:
-            self.convert_csv_to_qlib()
+            self.convert_csv_to_qlib(dump_mode=dump_mode)
 
 
 def main():
@@ -528,6 +825,10 @@ def main():
     parser.add_argument('--high-speed', action='store_true', help='Enable high-speed mode')
     parser.add_argument('--max_concurrent', type=int, default=10, help='Max concurrent requests')
     parser.add_argument('--stage', type=str, default='all', choices=['all', 'download', 'convert'], help='Execution stage')
+    parser.add_argument('--fetch_mode', type=str, default='by_date', choices=['by_date', 'by_stock'],
+                        help='by_date: batch fetch all stocks per trade-date (fast for incremental). by_stock: legacy per-stock loop')
+    parser.add_argument('--dump_mode', type=str, default='dump_all', choices=['dump_all', 'dump_update'],
+                        help='dump_all: full rebuild. dump_update: incremental append')
     args = parser.parse_args()
 
     token = args.token or os.environ.get('TUSHARE_API_KEY', '').strip() or os.environ.get('TUSHARE_TOKEN', '').strip() or get_tushare_token()
@@ -548,16 +849,20 @@ def main():
         max_stocks=args.max_stocks,
         high_speed=args.high_speed,
         csv_dir=args.csv_dir,
-        max_concurrent=args.max_concurrent
+        max_concurrent=args.max_concurrent,
+        fetch_mode=args.fetch_mode,
     )
 
     if args.stage == 'all':
-        asyncio.run(pipeline.run())
+        asyncio.run(pipeline.run(dump_mode=args.dump_mode))
     elif args.stage == 'download':
-        success, fail = asyncio.run(pipeline.download_all_to_csv())
+        if args.fetch_mode == 'by_date':
+            success, fail = asyncio.run(pipeline.download_all_to_csv_by_date())
+        else:
+            success, fail = asyncio.run(pipeline.download_all_to_csv())
         print(f"\n[STAT] Download completed! Success: {success}, Fail: {fail}")
     elif args.stage == 'convert':
-        success = pipeline.convert_csv_to_qlib()
+        success = pipeline.convert_csv_to_qlib(dump_mode=args.dump_mode)
         if not success:
             sys.exit(1)
 

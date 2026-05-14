@@ -5,9 +5,9 @@
 
 每行：标的代码 \\t 开始日期 \\t 结束日期（YYYY-MM-DD，制表符分隔）
 
-用法：
+用法：30
     python index_weight_to_instruments.py
-    python index_weight_to_instruments.py --start_date 20200101 --end_date 20260430
+    python index_weight_to_instruments.py --start_date 20200101 --end_date 202604
     python index_weight_to_instruments.py --output_dir D:/qlib_data/qlib_data/instruments
 """
 

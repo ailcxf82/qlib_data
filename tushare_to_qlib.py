@@ -336,107 +336,53 @@ class APIRateLimiter:
 
         last_exception = None
 
-
-
         for attempt in range(self.MAX_RETRIES):
-
             try:
-
-
                 api_lock = self._api_locks.get(api_name)
-
                 if api_lock is None:
-
                     api_lock = threading.Lock()
-
                     self._api_locks[api_name] = api_lock
-
                 with api_lock:
-
-
-
+                    self.wait_if_needed(api_name)
                     self.record_request(api_name)
 
-
-
-
                 result = func(*args, **kwargs)
-
-
-
                 return result
 
-
-
             except Exception as e:
-
                 last_exception = e
-
                 error_msg = str(e).lower()
 
-
-
-
                 is_rate_limit_error = any(keyword in error_msg for keyword in [
-
-                    'limit', 'too many', '', '', ''
-
+                    'limit', 'too many', 'freq', 'rate'
                 ])
 
-
+                delay = min(2 ** attempt * 1.0, 30.0)
 
                 if is_rate_limit_error and attempt < self.MAX_RETRIES - 1:
-
-
                     logger.warning(
-
                         f"[{api_name}] rate limit ({attempt+1}/{self.MAX_RETRIES}): {e}"
-
-                        f"\n    {delay} ..."
-
+                        f"\n    waiting {delay:.1f}s ..."
                     )
-
                     time.sleep(delay)
-
-
-
 
                     if api_name in self.RATE_LIMITS:
-
                         current_rate = self.RATE_LIMITS[api_name]['current']
-
-                        new_rate = max(5, current_rate * 0.7)  # 30%??
-
+                        new_rate = max(5, current_rate * 0.7)
                         self.RATE_LIMITS[api_name]['current'] = new_rate
-
                         logger.info(
-
-                            f"[{api_name}] : "
-
-                            f"{current_rate:.1f} -> {new_rate:.1f} ?"
-
+                            f"[{api_name}] rate adjusted: "
+                            f"{current_rate:.1f} -> {new_rate:.1f} req/min"
                         )
 
-
-
                 elif attempt < self.MAX_RETRIES - 1:
-
-
                     logger.warning(
-
-                        f"[{api_name}]  ({attempt+1}/{self.MAX_RETRIES}): {e}"
-
-                        f"\n    {delay} ..."
-
+                        f"[{api_name}] error ({attempt+1}/{self.MAX_RETRIES}): {e}"
+                        f"\n    waiting {delay:.1f}s ..."
                     )
-
                     time.sleep(delay)
 
-
-
-
-        logger.error(f"[{api_name}]  {self.MAX_RETRIES} ")
-
+        logger.error(f"[{api_name}] failed after {self.MAX_RETRIES} retries")
         raise last_exception
 
 
@@ -545,28 +491,33 @@ def get_tushare_token() -> Optional[str]:
 
 
 class TushareDataFetcher:
+    """Tushare data fetcher with caching"""
 
-    """
-        """"""
+    def __init__(self, token: str, rate_limiter=None, cache_dir: str = None):
+        import tushare as ts
+        ts.set_token(token)
+        self.pro = ts.pro_api()
+        self.rate_limiter = rate_limiter
+        if cache_dir:
+            self._cache_dir = Path(cache_dir)
+        else:
+            self._cache_dir = Path(r"D:\qlib_data\cache")
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
 
+    def _cache_path(self, name: str) -> Path:
+        return self._cache_dir / name
+
+    def _load_cache(self, name: str) -> Optional[pd.DataFrame]:
+        """Load cached data"""
         p = self._cache_path(name)
-
         if p.exists():
-
             try:
-
                 return pd.read_parquet(p)
-
             except Exception:
-
                 try:
-
                     return pd.read_csv(p)
-
                 except Exception:
-
                     pass
-
         return None
 
 
@@ -597,7 +548,7 @@ class TushareDataFetcher:
 
 
 
-        #         if cached is not None and len(cached) > 0:
+        if cached is not None and len(cached) > 0:
 
             return cached
 
@@ -616,20 +567,12 @@ class TushareDataFetcher:
 
 
         if self.rate_limiter:
-
             df = self.rate_limiter.execute_with_rate_limit('stock_basic', _fetch)
-
         else:
-
             df = _fetch()
 
-
-
-        #         if df is not None and len(df) > 0:
-
+        if df is not None and len(df) > 0:
             self._save_cache(cache_name, df)
-
-
 
         return df if df is not None else pd.DataFrame()
 
@@ -665,8 +608,7 @@ class TushareDataFetcher:
 
 
 
-        #         if cached is not None and len(cached) > 0:
-
+        if cached is not None and len(cached) > 0:
             return cached
 
 
@@ -717,21 +659,12 @@ class TushareDataFetcher:
 
 
             if not isinstance(df, pd.DataFrame):
-
-                logger.warning(f"[{ts_code}] stk_factor_pro ataFrame: {type(df)}?)
-
+                logger.warning(f"[{ts_code}] stk_factor_pro not DataFrame: {type(df)}")
                 df = pd.DataFrame(df)
 
-
-
-
-                logger.info(f"  ?Getcolumns{ts_code} ?{len(df)} ?)
-
+            if df is not None and len(df) > 0:
+                logger.info(f"[{ts_code}] stk_factor_pro got {len(df)} rows")
                 self._save_cache(cache_name, df)
-
-            else:
-
-                logger.info(f"    {ts_code} ")
 
 
 
@@ -779,8 +712,7 @@ class TushareDataFetcher:
 
 
 
-        #         if cached is not None and len(cached) > 0:
-
+        if cached is not None and len(cached) > 0:
             return cached
 
 
@@ -826,22 +758,14 @@ class TushareDataFetcher:
 
 
             if not isinstance(df, pd.DataFrame):
-
                 df = pd.DataFrame(df)
 
-
-
-
+            if df is not None and len(df) > 0:
                 self._save_cache(cache_name, df)
-
-
 
             return df
 
-
-
         except Exception as e:
-
             logger.warning(f"Get {ts_code} money flow: {e}")
 
             return pd.DataFrame()
@@ -876,8 +800,7 @@ class TushareDataFetcher:
 
 
 
-        #         if cached is not None and len(cached) > 0:
-
+        if cached is not None and len(cached) > 0:
             return cached
 
 
@@ -923,22 +846,14 @@ class TushareDataFetcher:
 
 
             if not isinstance(df, pd.DataFrame):
-
                 df = pd.DataFrame(df)
 
-
-
-
+            if df is not None and len(df) > 0:
                 self._save_cache(cache_name, df)
-
-
 
             return df
 
-
-
         except Exception as e:
-
             logger.warning(f"Get {ts_code} margin tradingdata: {e}")
 
             return pd.DataFrame()
@@ -977,8 +892,7 @@ class TushareDataFetcher:
 
 
 
-        #         if cached is not None and len(cached) > 0:
-
+        if cached is not None and len(cached) > 0:
             return cached
 
 
@@ -1024,22 +938,14 @@ class TushareDataFetcher:
 
 
             if not isinstance(df, pd.DataFrame):
-
                 df = pd.DataFrame(df)
 
-
-
-
+            if df is not None and len(df) > 0:
                 self._save_cache(cache_name, df)
-
-
 
             return df
 
-
-
         except Exception as e:
-
             logger.warning(f"Get {ts_code} financial indicators: {e}")
 
             return pd.DataFrame()
@@ -1049,31 +955,32 @@ class TushareDataFetcher:
 
 
 class QlibDataConverter:
+    """Qlib data converter"""
 
-    """
+    def __init__(self, output_dir: str):
+        self.output_dir = Path(output_dir)
+        self.calendars_dir = self.output_dir / 'calendars'
+        self.instruments_dir = self.output_dir / 'instruments'
+        self.features_dir = self.output_dir / 'features'
+        self.calendars_dir.mkdir(parents=True, exist_ok=True)
+        self.instruments_dir.mkdir(parents=True, exist_ok=True)
+        self.features_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_calendar(self, dates, freq='day'):
         """
-
+        Save calendar dates to file
         
-
-
-
-        Args?            dates: ?            freq:  (day/min?
-
+        Args:
+            dates: list of dates
+            freq: frequency (day/minute)
         """
-
         calendar_path = self.calendars_dir / f'{freq}.txt'
 
-
-
         date_strings = [d.strftime('%Y-%m-%d') for d in sorted(dates)]
-
         with open(calendar_path, 'w', encoding='utf-8') as f:
-
             f.write('\n'.join(date_strings))
 
-
-
-        logger.info(f"? {calendar_path}, ?{len(date_strings)} ")
+        logger.info(f"Saved calendar: {calendar_path}, {len(date_strings)} dates")
 
 
 
@@ -1107,7 +1014,7 @@ class QlibDataConverter:
 
 
 
-        logger.info(f": {instruments_path}, ?{len(stock_list)} ?)
+        logger.info(f": {instruments_path}, ?{len(stock_list)} ?")
 
 
 
@@ -1143,7 +1050,7 @@ class QlibDataConverter:
 
         if col not in df.columns:
 
-            logger.warning(f" {col} ?)
+            logger.warning(f" {col} ")
 
             return
 
@@ -1221,7 +1128,7 @@ class QlibDataConverter:
 
 
 
-        logger.debug(f" {field} bin: {len(values)} ?)
+        logger.debug(f" {field} bin: {len(values)} ")
 
 
 
@@ -1259,19 +1166,12 @@ class QlibDataConverter:
 
         base_fields = ['open_qfq', 'high_qfq', 'low_qfq', 'close_qfq', 'vol', 'amount']
 
-
-
-
+        tech_fields = [
             'turnover_rate', 'volume_ratio', 'pe', 'pb', 'ps', 'dv_ratio',
-
             'ps_ttm', 'pe_ttm', 'dv_ttm', 'total_mv',
-
             'kdj_qfq', 'kdj_d_qfq', 'kdj_k_qfq', 'rsi_qfq_12',
-
             'macd_qfq', 'macd_dea_qfq', 'macd_dif_qfq', 'atr_qfq', 'mtmma_qfq',
-
             'turnover_rate_f'
-
         ]
 
 
@@ -1310,7 +1210,7 @@ class QlibDataConverter:
 
         available_fields = [f for f in all_fields if f in merged_df.columns]
 
-        logger.info(f"?{len(available_fields)} ?)
+        logger.info(f"?{len(available_fields)} ")
 
 
 
@@ -1428,6 +1328,7 @@ class DataPipeline:
 
 
 
+        self.rate_limiter = APIRateLimiter(high_speed=high_speed)
         self.fetcher = TushareDataFetcher(token, rate_limiter=self.rate_limiter)
 
         self.converter = QlibDataConverter(output_dir)
@@ -1440,14 +1341,9 @@ class DataPipeline:
 
         self.download_workers = max(1, int(download_workers))
 
-
-
-
-
+        if csv_dir:
             self.csv_dir = Path(csv_dir)
-
         else:
-
             self.csv_dir = Path(r"D:\qlib_data\csv_data")
 
 
@@ -1477,27 +1373,16 @@ class DataPipeline:
         """
 
         try:
-
             csv_filename = f"{ts_code.lower()}.csv"
-
             csv_path = self.csv_dir / csv_filename
-
             if csv_path.exists():
-
                 return "skip"
 
-
-
             df = self.fetch_all_data_for_stock(ts_code)
-
             if df.empty:
-
                 return "fail"
-
             return "success" if self.save_stock_to_csv(ts_code, df) else "fail"
-
         except Exception as e:
-
             logger.error(f" {ts_code} ? {e}")
 
             return "fail"
@@ -1587,7 +1472,7 @@ class DataPipeline:
 
         else:
 
-            logger.info("  ?)
+            logger.info("  ")
 
 
 
@@ -1616,7 +1501,7 @@ class DataPipeline:
 
         else:
 
-            logger.info("  ?)
+            logger.info("  ")
 
 
 
@@ -1635,8 +1520,8 @@ class DataPipeline:
 
 
         if not fina_df.empty:
-
-
+            if 'end_date' in fina_df.columns and 'datetime' not in fina_df.columns:
+                fina_df['datetime'] = pd.to_datetime(fina_df['end_date'])
             fina_df.set_index(['datetime'], inplace=True)
 
 
@@ -1676,7 +1561,7 @@ class DataPipeline:
 
             if roe_col and factor_df[roe_col].notna().any():
 
-                logger.info(f"  ?columns{factor_df[roe_col].notna().sum()} ?)
+                logger.info(f"  ?columns{factor_df[roe_col].notna().sum()} ")
 
             elif roe_col:
 
@@ -1728,7 +1613,7 @@ class DataPipeline:
 
                 if 'roe' in factor_df.columns and factor_df['roe'].notna().any():
 
-                    logger.info(f"  ?merge {factor_df['roe'].notna().sum()} ?)
+                    logger.info(f"  ?merge {factor_df['roe'].notna().sum()} ")
 
             else:
 
@@ -1763,13 +1648,13 @@ class DataPipeline:
 
 
 
-                    fill_info = ', '.join([f"{col}:{before_fill[col]}after_fill[col]}" for col in existing_cols])
+                    fill_info = ', '.join([f"{col}:{before_fill[col]}->{after_fill[col]}" for col in existing_cols])
 
                     logger.info(f"  ?financial indicators ({fill_info})")
 
         else:
 
-            logger.info("    ?)
+            logger.info("    ")
 
 
 
@@ -1782,7 +1667,7 @@ class DataPipeline:
 
 
 
-        logger.info(f"  {ts_code} dataGet {len(factor_df)} ?)
+        logger.info(f"  {ts_code} dataGet {len(factor_df)} ")
 
         return factor_df
 
@@ -1890,7 +1775,7 @@ class DataPipeline:
 
             stock_codes = stock_codes[:self.max_stocks]
 
-            logger.info(f"?{self.max_stocks} ?)
+            logger.info(f"?{self.max_stocks} ")
 
 
 
@@ -2020,11 +1905,11 @@ class DataPipeline:
 
         logger.info("?SV:")
 
-        logger.info(f"  ?: {success_count} ?)
+        logger.info(f"  ?: {success_count} ")
 
-        logger.info(f"    (?: {skipped_count} ?)
+        logger.info(f"    (?: {skipped_count} ")
 
-        logger.info(f"  ?: {fail_count} ?)
+        logger.info(f"  ?: {fail_count} ")
 
         logger.info(f"   CSV? {self.csv_dir}")
 
@@ -2034,7 +1919,7 @@ class DataPipeline:
 
 
 
-    def convert_csv_to_qlib(self) -> bool:
+    def convert_csv_to_qlib(self, dump_mode: str = "dump_all") -> bool:
 
         """
 
@@ -2042,11 +1927,17 @@ class DataPipeline:
 
         ?features/<stock code>/<>.day.bin qlib LocalFeatureProvider
 
-         features/<>.day.bin ?        """
+         features/<>.day.bin ?
+
+        Args:
+            dump_mode: "dump_all" or "dump_update"
+                dump_all: rebuild all data (calendars, instruments, features)
+                dump_update: incremental update, only append new dates
+        """
 
         logger.info("\n" + "="*80)
 
-        logger.info("?/2CSVlib?dump_bin.DumpDataAll?)
+        logger.info("?/2CSVlib?dump_bin.DumpDataAll")
 
         logger.info("="*80)
 
@@ -2067,24 +1958,6 @@ class DataPipeline:
 
 
         logger.info(f" {len(csv_files)} SV")
-
-
-
-        for csv_path in csv_files:
-
-            try:
-
-                df_patch = pd.read_csv(csv_path, encoding="utf-8-sig")
-
-                add_qlib_standard_ohlcv_columns(df_patch)
-
-                df_patch.to_csv(csv_path, index=False, encoding="utf-8-sig")
-
-            except Exception as e:
-
-                logger.warning("?%s  OHLCV ? %s", csv_path.name, e)
-
-
 
         sample = pd.read_csv(csv_files[0], nrows=512, encoding="utf-8-sig")
 
@@ -2123,11 +1996,8 @@ class DataPipeline:
         if not dump_script.is_file():
 
             logger.error(
-
-                "columnsqlib  dump_bin.py: %s qlib ?QLIB_SOURCE  qlib ?,
-
+                "Cannot find qlib dump_bin.py: %s. Set QLIB_SOURCE env or install qlib",
                 dump_script,
-
             )
 
             return False
@@ -2138,7 +2008,7 @@ class DataPipeline:
 
             sys.path.insert(0, str(scripts_dir))
 
-
+        out_dir = str(self.converter.output_dir)
 
         try:
 
@@ -2146,53 +2016,73 @@ class DataPipeline:
 
         except ImportError as exc:
 
-            logger.error(
-
-                " dump_bin qlib: pip install qlib? %s",
-
+            logger.warning(
+                "Cannot import dump_bin directly: %s. Trying conda env qlib_zhengshi...",
                 exc,
-
             )
 
-            return False
+            try:
+                import subprocess
+                cmd = [
+                    "conda", "run", "-n", "qlib_zhengshi",
+                    "python", str(dump_script), dump_mode,
+                    f"--data_path={self.csv_dir}",
+                    f"--qlib_dir={out_dir}",
+                    f"--include_fields={include_fields}",
+                    "--date_field_name=datetime",
+                    "--symbol_field_name=instrument",
+                    "--freq=day",
+                    f"--max_workers={min(16, (os.cpu_count() or 4))}",
+                ]
+                logger.info("Running: %s", " ".join(cmd))
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+                if result.stdout:
+                    logger.info(result.stdout)
+                if result.stderr:
+                    logger.warning(result.stderr)
+                if result.returncode != 0:
+                    logger.error("conda run dump_bin failed with return code %d", result.returncode)
+                    return False
+                logger.info("conda run dump_bin completed successfully")
+                return True
+            except Exception as sub_exc:
+                logger.error("conda run dump_bin also failed: %s", sub_exc)
+                return False
 
-
-
-        out_dir = str(self.converter.output_dir)
-
+        max_workers = min(16, (os.cpu_count() or 4))
         try:
-
-            dumper = DumpDataAll(
-
-                data_path=str(self.csv_dir),
-
-                qlib_dir=out_dir,
-
-                date_field_name="datetime",
-
-                symbol_field_name="instrument",
-
-                include_fields=include_fields,
-
-                freq="day",
-
-                max_workers=min(16, (os.cpu_count() or 4)),
-
-            )
-
+            if dump_mode == "dump_update":
+                from dump_bin import DumpDataUpdate
+                dumper = DumpDataUpdate(
+                    data_path=str(self.csv_dir),
+                    qlib_dir=out_dir,
+                    date_field_name="datetime",
+                    symbol_field_name="instrument",
+                    include_fields=include_fields,
+                    freq="day",
+                    max_workers=max_workers,
+                )
+            else:
+                from dump_bin import DumpDataAll
+                dumper = DumpDataAll(
+                    data_path=str(self.csv_dir),
+                    qlib_dir=out_dir,
+                    date_field_name="datetime",
+                    symbol_field_name="instrument",
+                    include_fields=include_fields,
+                    freq="day",
+                    max_workers=max_workers,
+                )
             dumper.dump()
-
         except Exception:
-
             logger.exception("dump_bin ")
-
             return False
 
 
 
         logger.info("\n" + "="*80)
 
-        logger.info("?lib: calendars/ + instruments/ + features/<>/?)
+        logger.info("?lib: calendars/ + instruments/ + features/<>/")
 
         logger.info("="*80)
 
@@ -2206,15 +2096,15 @@ class DataPipeline:
 
 
 
-    def run(self, stock_codes: List[str] = None):
+    def run(self, stock_codes: List[str] = None, dump_mode: str = "dump_all"):
 
         """
 
-        
 
 
-
-        Args?            stock_codes: stock codeone?        """
+        Args?            stock_codes: stock codeone?
+            dump_mode: "dump_all" or "dump_update"
+        """
 
         logger.info("\n" + "="*80)
 
@@ -2240,7 +2130,7 @@ class DataPipeline:
 
         if success > 0:
 
-            self.convert_csv_to_qlib()
+            self.convert_csv_to_qlib(dump_mode=dump_mode)
 
         else:
 
@@ -2276,97 +2166,32 @@ class DataPipeline:
 
 
     def _print_final_stats(self, success_count: int, fail_count: int, merged_df: Optional[pd.DataFrame]):
-
-        """
-        epilog="""
-
-?  TUSHARE_API_KEY  - Tushare API Token
-
-  TUSHARE_TOKEN    - ?
-
-?  # Token
-
-  set TUSHARE_API_KEY=your_token
-
-  python tushare_to_qlib.py --start_date 20200101 --end_date 20231231
+        """Print final statistics"""
+        logger.info(f"Final stats: success={success_count}, fail={fail_count}")
 
 
-
-
-  python tushare_to_qlib.py --token YOUR_TOKEN --start_date 20200101 --end_date 20231231
-
-
-
-
-  python tushare_to_qlib.py --start_date 20230101 --end_date 20231231 --max_stocks 10
-
-
-
-
-
-
-
-
-
-rate limit?   (): 5000
-
-    - stk_factor_pro: 30?
-
-    - : 20-30?
-
-
-
-  ?(--high-speed): ?000+
-
-    - stk_factor_pro: 500?
-
-    - : 40-120?
-
-        """
-
-    )
-
-
-
+def main():
+    parser = argparse.ArgumentParser(description='Tushare to Qlib data pipeline')
     parser.add_argument('--token', type=str, default=None,
-
-                        help='Tushare Pro API Token TUSHARE_API_KEY?)
-
+                        help='Tushare Pro API Token (env: TUSHARE_API_KEY)')
     parser.add_argument('--start_date', type=str, default='20200101',
-
-                        help='start date(YYYYMMDD)? 20200101')
-
+                        help='start date(YYYYMMDD), default: 20200101')
     parser.add_argument('--end_date', type=str, default='20231231',
-
-                        help='end date (YYYYMMDD)? 20231231')
-
+                        help='end date (YYYYMMDD), default: 20231231')
     parser.add_argument('--output_dir', type=str,
-
                         default=r'D:\qlib_data\qlib_data',
-
-                        help=f'Qlibdata? D:\\qlib_data\\qlib_data')
-
+                        help=f'Qlib data output dir, default: D:\\qlib_data\\qlib_data')
     parser.add_argument('--csv_dir', type=str, default=r'D:\qlib_data\csv_data',
-
-                        help='CSV? D:\\qlib_data\\csv_data?)
-
+                        help='CSV temp dir, default: D:\\qlib_data\\csv_data')
     parser.add_argument('--max_stocks', type=int, default=None,
-
-                        help=': ')
-
+                        help='max stocks to process')
     parser.add_argument('--high-speed', action='store_true',
-
-                        help='?000+?)
-
+                        help='high speed mode (requires 8000+ Tushare points)')
     parser.add_argument('--download_workers', type=int, default=4,
-
-                        help=': 4?2-8?)
-
+                        help='download workers, default: 4 (suggest 2-8)')
     parser.add_argument('--stage', type=str, default='all',
-
                         choices=['all', 'download', 'convert'],
-
-                        help=': all()/download(SV)/convert(Qlib)? all')
+                        help='stage: all/download/convert, default: all')
 
 
 
@@ -2393,7 +2218,7 @@ rate limit?   (): 5000
 
         if token:
 
-            logger.info("  ?TUSHARE_TOKEN Getoken?TUSHARE_API_KEY?)
+            logger.info("  ?TUSHARE_TOKEN Getoken?TUSHARE_API_KEY")
 
 
 
@@ -2405,23 +2230,14 @@ rate limit?   (): 5000
 
 
     if not token:
-
-        print("\n?Tushare API Token?)
-
-        print("\nToken?)
-
-        print("  1. ? --token YOUR_TOKEN")
-
-        print("  2. : set TUSHARE_API_KEY=YOUR_TOKEN")
-
-        print("  3. : config/secrets.yaml")
-
-        print("\n:")
-
+        print("\nError: Tushare API Token not found!")
+        print("\nPlease set token via one of:")
+        print("  1. Command line: --token YOUR_TOKEN")
+        print("  2. Environment: set TUSHARE_API_KEY=YOUR_TOKEN")
+        print("  3. Config file: config/secrets.yaml")
+        print("\nExample:")
         print("  set TUSHARE_API_KEY=your_token_here")
-
         print("  python tushare_to_qlib.py --start_date 20230101 --end_date 20231231\n")
-
         sys.exit(1)
 
 
